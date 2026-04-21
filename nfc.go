@@ -271,40 +271,13 @@ func (b *FilamentBridge) AssignSpoolToLocation(spoolID int, printerName string, 
 			return fmt.Errorf("failed to set toolhead mapping: %w", err)
 		}
 
-		// Get toolhead display name (custom or default)
-		// Find printer ID first
-		printerConfigs, err := b.GetAllPrinterConfigs()
-		var displayName string
-		if err == nil {
-			for printerID, printerConfig := range printerConfigs {
-				if printerConfig.Name == printerName {
-					name, err := b.GetToolheadName(printerID, toolheadID)
-					if err == nil {
-						displayName = name
-					} else {
-						displayName = fmt.Sprintf("Toolhead %d", toolheadID)
-					}
-					break
-				}
-			}
-		}
-		if displayName == "" {
-			displayName = fmt.Sprintf("Toolhead %d", toolheadID)
-		}
-
-		// Update Spoolman location using proper location entities with custom name
-		locationName := fmt.Sprintf("%s - %s", printerName, displayName)
-		
-		// Note: Spoolman API doesn't support creating locations via POST.
-		// The location will be auto-created when we update the spool's location field.
-		
-		if err := b.spoolman.UpdateSpoolLocation(spoolID, locationName); err != nil {
+		if err := b.updateSpoolToolheadLocation(spoolID, printerName, toolheadID); err != nil {
 			// If Spoolman update fails, we should still log it but not fail the entire operation
 			// since the FilaBridge mapping is more critical
 			log.Printf("Warning: Failed to update Spoolman location for spool %d: %v", spoolID, err)
 		}
 
-		log.Printf("Successfully assigned spool %d to %s toolhead %d (%s)", spoolID, printerName, toolheadID, displayName)
+		log.Printf("Successfully assigned spool %d to %s toolhead %d", spoolID, printerName, toolheadID)
 	} else {
 		// This is a non-printer location (drybox, storage, etc.)
 		// First, check if this spool is currently assigned to any toolhead and clear it

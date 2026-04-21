@@ -22,6 +22,66 @@
     color: #fff;
 }
 
+.printer-progress {
+    margin-top: 16px;
+    padding: 14px 16px;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+}
+
+.printer-progress-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+
+.printer-progress-label {
+    color: #9fb3c8;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+.printer-progress-job {
+    color: #fff;
+    font-weight: 600;
+    word-break: break-word;
+}
+
+.printer-progress-percent {
+    color: #7ee787;
+    font-size: 20px;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.printer-progress-bar {
+    width: 100%;
+    height: 10px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 999px;
+    overflow: hidden;
+}
+
+.printer-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #2ea043 0%, #7ee787 100%);
+    border-radius: 999px;
+    transition: width 0.3s ease;
+}
+
+.printer-progress-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    margin-top: 10px;
+    color: #c9d1d9;
+    font-size: 13px;
+}
+
 .mapping-section {
     margin-top: 20px;
     padding-top: 20px;
@@ -83,4 +143,12 @@
 .printer-card .btn-small {
     padding: 5px 10px;
     font-size: 12px;
+}
+
+@media (max-width: 640px) {
+    .printer-progress-header,
+    .printer-progress-meta {
+        flex-direction: column;
+        align-items: flex-start;
+    }
 }

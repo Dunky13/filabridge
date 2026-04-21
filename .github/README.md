@@ -1,7 +1,5 @@
 # FilaBridge
 
-**UPDATE: DEVELOPMENT IS PERMANENTLY HALTED AFTER PRUSA STOLE THOUSANDS OF DOLLARS FROM ME AND OVER SIX MONTHS OF MY LIFE DUE TO THEIR SHITTY SUPPORT AND NOT ABLE TO MAKE WORKING PRINTERS.**
-
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Go Version](https://img.shields.io/badge/Go-1.23-00ADD8?logo=go)](https://golang.org/)
 [![GitHub release](https://img.shields.io/github/v/release/needo37/filabridge)](https://github.com/needo37/filabridge/releases)
@@ -32,6 +30,7 @@ I run multiple 3D printers and use Spoolman to track my filament inventory. The 
 ## Why FilaBridge?
 
 Managing filament inventory across multiple 3D printers is tedious. FilaBridge automates this by:
+
 - Monitoring your printers in real-time with live WebSocket updates
 - Tracking which spools are loaded on which toolheads
 - Automatically updating your Spoolman inventory when prints complete
@@ -45,16 +44,16 @@ No more manual updates or guesswork about remaining filament!
 ## Screenshots
 
 ![FilaBridge Dashboard](https://github.com/needo37/filabridge/blob/main/screenshots/dashboard.png?raw=true)
-*FilaBridge main dashboard showing printer status and toolhead mappings*
+_FilaBridge main dashboard showing printer status and toolhead mappings_
 
 ![Spool Tags Management](https://github.com/needo37/filabridge/blob/main/screenshots/spool_tags.png?raw=true)
-*NFC Management interface for generating QR codes for individual spools*
+_NFC Management interface for generating QR codes for individual spools_
 
 ![Filament Tags Management](https://github.com/needo37/filabridge/blob/main/screenshots/filament_tags.png?raw=true)
-*Filament type QR code generation for new unopened spools*
+_Filament type QR code generation for new unopened spools_
 
 ![Location Tags Management](https://github.com/needo37/filabridge/blob/main/screenshots/location_tags.png?raw=true)
-*Location management interface for creating printer toolhead and storage location QR codes*
+_Location management interface for creating printer toolhead and storage location QR codes_
 
 ## Prerequisites
 
@@ -70,11 +69,13 @@ No more manual updates or guesswork about remaining filament!
 ### Option 1: Docker (Easiest)
 
 1. **Run Spoolman** (if not already running):
+
    ```bash
    docker run -d --name spoolman -p 8000:8000 -v spoolman-data:/home/spoolman/data ghcr.io/donkie/spoolman:latest
    ```
 
 2. **Run FilaBridge**:
+
    ```bash
    docker run -d --name filabridge -p 5000:5000 \
      -v .:/app/data \
@@ -84,6 +85,7 @@ No more manual updates or guesswork about remaining filament!
 3. **Configure**: Open `http://localhost:5000` and click "⚙️ Configuration"
 
 **Using docker-compose (recommended for full stack):**
+
 ```bash
 git clone https://github.com/needo37/filabridge.git
 cd filabridge
@@ -100,16 +102,19 @@ The docker-compose.yml automatically sets the `FILABRIDGE_DB_PATH` environment v
    - Windows (amd64)
 
 2. **Make it executable** (Linux/macOS):
+
    ```bash
    chmod +x filabridge
    ```
 
 3. **Run Spoolman** (if not already running):
+
    ```bash
    docker run -d --name spoolman -p 8000:8000 -v spoolman-data:/home/spoolman/data ghcr.io/donkie/spoolman:latest
    ```
 
 4. **Start FilaBridge**:
+
    ```bash
    ./filabridge
    ```
@@ -119,6 +124,7 @@ The docker-compose.yml automatically sets the `FILABRIDGE_DB_PATH` environment v
 ### Option 3: Build from Source
 
 1. **Clone and build**:
+
    ```bash
    git clone https://github.com/needo37/filabridge.git
    cd filabridge
@@ -127,6 +133,7 @@ The docker-compose.yml automatically sets the `FILABRIDGE_DB_PATH` environment v
    ```
 
 2. **Run Spoolman** (if not already running):
+
    ```bash
    docker run -d --name spoolman -p 8000:8000 -v spoolman-data:/home/spoolman/data ghcr.io/donkie/spoolman:latest
    ```
@@ -185,7 +192,7 @@ The web interface provides:
 ### NFC Tag Management
 
 1. **Generate QR Codes**: Navigate to NFC Management tab in the web interface
-2. **Create Tags**: 
+2. **Create Tags**:
    - **Spool Tags**: Generate QR codes for individual spools
    - **Filament Tags**: Generate QR codes for filament types (for new unopened spools)
    - **Location Tags**: Create and generate QR codes for printer toolheads and custom locations (dryboxes, storage shelves, etc.)
@@ -265,6 +272,7 @@ filabridge/
 ### Logs
 
 The service logs important events to the console. Look for:
+
 - Printer status updates
 - Filament usage calculations
 - Spoolman update confirmations
@@ -315,6 +323,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
 ## Support the Project
 
 If you find FilaBridge useful:
+
 - ⭐ Star the repository
 - 🐛 Report bugs and suggest features
 - 📢 Share it with the 3D printing community
@@ -327,6 +336,7 @@ This project is licensed under the GNU General Public License v3.0 - see the [LI
 ## Support
 
 For issues specific to:
+
 - **PrusaLink**: Check Prusa's documentation
 - **Spoolman**: Visit the [Spoolman GitHub repository](https://github.com/pdrd/spoolman)
 - **This bridge**: Open an issue in this repository

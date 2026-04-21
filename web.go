@@ -4,6 +4,7 @@ import (
 	"embed"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -121,7 +122,9 @@ func generateToolheadIDs(count int) []int {
 func (ws *WebServer) setupRoutes() {
 	// Load HTML templates with custom functions from embedded filesystem
 	tmpl := template.Must(template.New("").Funcs(template.FuncMap{
-		"generateToolheadIDs": generateToolheadIDs,
+		"generateToolheadIDs":   generateToolheadIDs,
+		"formatDurationSeconds": formatDurationSeconds,
+		"formatETASeconds":      formatETASeconds,
 	}).ParseFS(templatesFS, "templates/*"))
 	ws.router.SetHTMLTemplate(tmpl)
 
@@ -141,6 +144,9 @@ func (ws *WebServer) setupRoutes() {
 	{
 		api.GET("/status", ws.statusHandler)
 		api.GET("/spools", ws.spoolsHandler)
+		api.GET("/print-history", ws.getPrintHistoryHandler)
+		api.POST("/print-history/import", ws.importPrintHistoryHandler)
+		api.PUT("/print-history/:id/spool", ws.updatePrintHistorySpoolHandler)
 		api.GET("/filaments", ws.filamentsHandler)
 		api.POST("/map_toolhead", ws.mapToolheadHandler)
 		api.GET("/available_spools", ws.availableSpoolsHandler)
@@ -172,6 +178,40 @@ func (ws *WebServer) setupRoutes() {
 
 	// WebSocket endpoint
 	ws.router.GET("/ws/status", ws.websocketHandler)
+}
+
+func formatDurationSeconds(seconds int) string {
+	if seconds <= 0 {
+		return "0m"
+	}
+
+	hours := seconds / 3600
+	minutes := (seconds % 3600) / 60
+
+	if hours > 0 {
+		return fmt.Sprintf("%dh %02dm", hours, minutes)
+	}
+
+	return fmt.Sprintf("%dm", minutes)
+}
+
+func formatETASeconds(seconds int) string {
+	if seconds <= 0 {
+		return "-"
+	}
+
+	eta := time.Now().Add(time.Duration(seconds) * time.Second)
+	now := time.Now()
+
+	if eta.Year() == now.Year() && eta.YearDay() == now.YearDay() {
+		return eta.Format("15:04")
+	}
+
+	if eta.Year() == now.Year() && eta.YearDay() == now.YearDay()+1 {
+		return "Tomorrow " + eta.Format("15:04")
+	}
+
+	return eta.Format("Jan 2 15:04")
 }
 
 // WebSocket hub methods
@@ -420,12 +460,100 @@ func (ws *WebServer) statusHandler(c *gin.Context) {
 
 // spoolsHandler returns all spools as JSON
 func (ws *WebServer) spoolsHandler(c *gin.Context) {
-	spools, err := ws.bridge.spoolman.GetAllSpools()
+	includeEmpty := strings.EqualFold(c.DefaultQuery("include_empty", "false"), "true") || c.DefaultQuery("include_empty", "0") == "1"
+
+	var (
+		spools []SpoolmanSpool
+		err    error
+	)
+
+	if includeEmpty {
+		spools, err = ws.bridge.spoolman.GetAllSpoolsIncludingEmpty()
+	} else {
+		spools, err = ws.bridge.spoolman.GetAllSpools()
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, spools)
+}
+
+func (ws *WebServer) getPrintHistoryHandler(c *gin.Context) {
+	limit := 200
+	if limitParam := c.Query("limit"); limitParam != "" {
+		parsedLimit, err := strconv.Atoi(limitParam)
+		if err != nil || parsedLimit <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "limit must be a positive integer"})
+			return
+		}
+		limit = parsedLimit
+	}
+
+	history, err := ws.bridge.GetPrintHistory(limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"history": history})
+}
+
+func (ws *WebServer) updatePrintHistorySpoolHandler(c *gin.Context) {
+	historyID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || historyID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid print history id"})
+		return
+	}
+
+	var req struct {
+		SpoolID *int `json:"spool_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
+		return
+	}
+
+	if req.SpoolID != nil && *req.SpoolID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "spool_id must be greater than 0"})
+		return
+	}
+
+	if err := ws.bridge.UpdatePrintHistorySpool(historyID, req.SpoolID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Print history updated successfully"})
+}
+
+func (ws *WebServer) importPrintHistoryHandler(c *gin.Context) {
+	var req struct {
+		PrinterID         string `json:"printer_id" binding:"required"`
+		DefaultToolheadID int    `json:"default_toolhead_id"`
+		Payload           string `json:"payload" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
+		return
+	}
+
+	summary, err := ws.bridge.ImportPrusaConnectPrintHistory(req.PrinterID, req.DefaultToolheadID, []byte(req.Payload))
+	if err != nil {
+		var validationErr *printHistoryImportValidationError
+		if errors.As(err, &validationErr) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": validationErr.Error()})
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Print history imported successfully",
+		"summary": summary,
+	})
 }
 
 // filamentsHandler returns all filament types as JSON
@@ -481,9 +609,10 @@ func validateAddress(address string) error {
 // mapToolheadHandler maps a spool to a toolhead
 func (ws *WebServer) mapToolheadHandler(c *gin.Context) {
 	var req struct {
-		PrinterName string `json:"printer_name" binding:"required"`
-		ToolheadID  int    `json:"toolhead_id"`
-		SpoolID     int    `json:"spool_id"`
+		PrinterName           string `json:"printer_name" binding:"required"`
+		ToolheadID            int    `json:"toolhead_id"`
+		SpoolID               int    `json:"spool_id"`
+		PreviousSpoolLocation string `json:"previous_spool_location"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -501,27 +630,26 @@ func (ws *WebServer) mapToolheadHandler(c *gin.Context) {
 		return
 	}
 
-	// Handle unmapping (SpoolID = 0) or mapping (SpoolID > 0)
-	if req.SpoolID == 0 {
-		// Unmap the toolhead
-		if err := ws.bridge.UnmapToolhead(req.PrinterName, req.ToolheadID); err != nil {
+	if err := ws.bridge.SwitchToolheadSpool(req.PrinterName, req.ToolheadID, req.SpoolID, req.PreviousSpoolLocation); err != nil {
+		switch {
+		case strings.Contains(err.Error(), "is already assigned to"):
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		case strings.Contains(err.Error(), "needs a storage location"),
+			strings.Contains(err.Error(), "previous spool location"),
+			strings.Contains(err.Error(), "auto-assign previous spool location"):
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		default:
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
 		}
-		c.JSON(http.StatusOK, gin.H{"message": "Toolhead unmapped successfully"})
-	} else {
-		// Map the spool to the toolhead
-		if err := ws.bridge.SetToolheadMapping(req.PrinterName, req.ToolheadID, req.SpoolID); err != nil {
-			// Check if this is a spool conflict error
-			if strings.Contains(err.Error(), "is already assigned to") {
-				c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-			} else {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			}
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"message": "Toolhead mapped successfully"})
+		return
 	}
+
+	if req.SpoolID == 0 {
+		c.JSON(http.StatusOK, gin.H{"message": "Toolhead unmapped successfully"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Toolhead mapped successfully"})
 }
 
 // availableSpoolsHandler returns spools available for assignment to a specific toolhead

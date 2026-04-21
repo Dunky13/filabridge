@@ -139,7 +139,96 @@ function updatePrinterStatuses(printers) {
             statusBadge.className = `status ${printerData.state}`;
             statusBadge.textContent = printerData.state;
         }
+
+        const existingProgress = printerElement.querySelector('.printer-progress');
+        const shouldShowProgress = printerData.state === 'PRINTING' || Boolean(printerData.current_job);
+
+        if (!shouldShowProgress) {
+            if (existingProgress) {
+                existingProgress.remove();
+            }
+            return;
+        }
+
+        const progressMarkup = `
+            <div class="printer-progress">
+                <div class="printer-progress-header">
+                    <div>
+                        <div class="printer-progress-label">Current Print</div>
+                        <div class="printer-progress-job">${escapeHtml(printerData.current_job || 'Active job')}</div>
+                    </div>
+                    <div class="printer-progress-percent">${Math.round(printerData.progress || 0)}%</div>
+                </div>
+                <div class="printer-progress-bar" aria-label="Print progress">
+                    <div class="printer-progress-fill" style="width: ${Math.max(0, Math.min(100, printerData.progress || 0))}%;"></div>
+                </div>
+                <div class="printer-progress-meta">
+                    <span>Elapsed: ${formatDuration(printerData.print_time || 0)}</span>
+                    <span>Remaining: ${formatDuration(printerData.print_time_left || 0)}</span>
+                    <span>ETA: ${formatEta(printerData.print_time_left || 0)}</span>
+                </div>
+            </div>
+        `;
+
+        if (existingProgress) {
+            existingProgress.outerHTML = progressMarkup;
+        } else {
+            const modelInfo = printerElement.querySelector('p');
+            if (modelInfo) {
+                modelInfo.insertAdjacentHTML('afterend', progressMarkup);
+            }
+        }
     });
+}
+
+function formatDuration(totalSeconds) {
+    if (!totalSeconds || totalSeconds <= 0) {
+        return '0m';
+    }
+
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+
+    if (hours > 0) {
+        return `${hours}h ${String(minutes).padStart(2, '0')}m`;
+    }
+
+    return `${minutes}m`;
+}
+
+function formatEta(totalSeconds) {
+    if (!totalSeconds || totalSeconds <= 0) {
+        return '-';
+    }
+
+    const eta = new Date(Date.now() + totalSeconds * 1000);
+    const now = new Date();
+
+    const sameDay = eta.getFullYear() === now.getFullYear() &&
+        eta.getMonth() === now.getMonth() &&
+        eta.getDate() === now.getDate();
+
+    if (sameDay) {
+        return eta.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', hour12: false});
+    }
+
+    const tomorrow = new Date(now);
+    tomorrow.setDate(now.getDate() + 1);
+    const isTomorrow = eta.getFullYear() === tomorrow.getFullYear() &&
+        eta.getMonth() === tomorrow.getMonth() &&
+        eta.getDate() === tomorrow.getDate();
+
+    if (isTomorrow) {
+        return `Tomorrow ${eta.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', hour12: false})}`;
+    }
+
+    return eta.toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false});
+}
+
+function escapeHtml(value) {
+    const div = document.createElement('div');
+    div.textContent = value == null ? '' : String(value);
+    return div.innerHTML;
 }
 
 function updateSpoolData(spools) {

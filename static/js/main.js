@@ -1,7 +1,7 @@
 // FilaBridge Dashboard - Main JavaScript Functions
 
 // Tab switching functionality
-function switchTab(tabName) {
+function switchTab(tabName, clickedElement) {
     // Hide all tab contents
     const tabContents = document.querySelectorAll('.tab-content');
     tabContents.forEach(content => {
@@ -18,7 +18,16 @@ function switchTab(tabName) {
     document.getElementById(tabName + '-tab').classList.add('active');
     
     // Add active class to clicked tab
-    event.target.classList.add('active');
+    if (clickedElement) {
+        clickedElement.classList.add('active');
+    } else {
+        const tabButtons = document.querySelectorAll('.tab');
+        tabButtons.forEach(btn => {
+            if (btn.getAttribute('onclick') && btn.getAttribute('onclick').includes(`'${tabName}'`)) {
+                btn.classList.add('active');
+            }
+        });
+    }
     
     // Load configuration when settings tab is opened
     if (tabName === 'settings') {
@@ -41,6 +50,8 @@ function switchTab(tabName) {
                 }
             }
         }
+    } else if (tabName === 'history') {
+        loadPrintHistory();
     }
 }
 
@@ -397,6 +408,7 @@ function convertTimestampsToLocal() {
 document.addEventListener('DOMContentLoaded', function() {
     convertTimestampsToLocal();
     connectWebSocket();
+    loadPrintHistory();
     loadNfcData();
     loadPrinters();
     initCustomDropdowns();

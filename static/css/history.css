@@ -1,0 +1,281 @@
+.history-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 20px;
+  margin-bottom: 20px;
+}
+
+.history-header h2 {
+  margin: 0 0 8px 0;
+}
+
+.history-subtitle {
+  margin: 0;
+  color: #ccc;
+  max-width: 700px;
+}
+
+.history-feedback {
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+}
+
+.history-feedback.success {
+  background: rgba(40, 167, 69, 0.15);
+  border-color: rgba(40, 167, 69, 0.4);
+  color: #9be7af;
+}
+
+.history-feedback.error {
+  background: rgba(220, 53, 69, 0.15);
+  border-color: rgba(220, 53, 69, 0.4);
+  color: #ffb3bc;
+}
+
+.history-import-panel {
+  margin-bottom: 20px;
+  padding: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.history-import-copy h3 {
+  margin: 0 0 8px 0;
+}
+
+.history-import-copy p {
+  margin: 0 0 16px 0;
+  color: #bbb;
+}
+
+.history-import-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(180px, 1fr));
+  gap: 14px;
+  margin-bottom: 14px;
+}
+
+.history-import-grid .form-group {
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.history-import-grid .history-select,
+.history-import-file input {
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.history-import-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.history-table-wrapper {
+  overflow-x: auto;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 1240px;
+  table-layout: fixed;
+}
+
+.history-table th,
+.history-table td {
+  padding: 14px 16px;
+  text-align: left;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  vertical-align: top;
+}
+
+.history-table th {
+  color: #ccc;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.history-table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.history-job {
+  font-weight: 600;
+  color: #fff;
+  font-size: 0.95rem;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-job-cell {
+  max-width: 240px;
+}
+
+.history-col-finished {
+  width: 170px;
+}
+
+.history-col-used {
+  width: 110px;
+  white-space: nowrap;
+}
+
+.history-col-spool {
+  width: 380px;
+}
+
+.history-col-print {
+  width: 270px;
+}
+
+.history-col-printer {
+  width: 150px;
+}
+
+.history-col-toolhead {
+  width: 140px;
+}
+
+.history-meta {
+  display: block;
+  margin-top: 4px;
+  color: #aaa;
+  font-size: 0.9rem;
+}
+
+.history-spool {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.history-spool-name {
+  font-weight: 600;
+}
+
+.history-select {
+  min-width: 260px;
+  max-width: 320px;
+}
+
+.history-spool-cell {
+  overflow: visible;
+}
+
+.history-action {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.history-action.has-pending-change {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.history-dropdown {
+  min-width: 0;
+  max-width: none;
+  width: 100%;
+}
+
+.history-dropdown-value {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.history-dropdown-copy {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.history-dropdown-label {
+  min-width: 0;
+  line-height: 1.3;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.history-dropdown-detail {
+  margin-top: 4px;
+  color: #aaa;
+  font-size: 0.85rem;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-dropdown .dropdown-button {
+  min-width: 0;
+  overflow: hidden;
+  align-items: flex-start;
+}
+
+.history-dropdown .option-text {
+  min-width: 0;
+}
+
+.history-save-btn[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.history-save-btn {
+  margin: 0;
+  flex: 0 0 auto;
+}
+
+.history-empty {
+  text-align: center;
+  color: #bbb;
+  padding: 30px 16px;
+}
+
+@media (max-width: 900px) {
+  .history-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .history-import-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .history-action {
+    grid-template-columns: 1fr;
+  }
+
+  .history-action.has-pending-change {
+    grid-template-columns: 1fr;
+  }
+
+  .history-select {
+    min-width: 100%;
+    max-width: none;
+  }
+}

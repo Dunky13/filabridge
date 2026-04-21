@@ -58,6 +58,26 @@
             
             <p><strong>Model:</strong> {{$printerConfig.Model}} ({{$printerConfig.Toolheads}} toolhead{{if ne $printerConfig.Toolheads 1}}s{{end}})</p>
 
+            {{if or (eq $printerData.State "PRINTING") $printerData.CurrentJob}}
+            <div class="printer-progress">
+                <div class="printer-progress-header">
+                    <div>
+                        <div class="printer-progress-label">Current Print</div>
+                        <div class="printer-progress-job">{{if $printerData.CurrentJob}}{{$printerData.CurrentJob}}{{else}}Active job{{end}}</div>
+                    </div>
+                    <div class="printer-progress-percent">{{printf "%.0f" $printerData.Progress}}%</div>
+                </div>
+                <div class="printer-progress-bar" aria-label="Print progress">
+                    <div class="printer-progress-fill" style="width: {{printf "%.2f" $printerData.Progress}}%;"></div>
+                </div>
+                <div class="printer-progress-meta">
+                    <span>Elapsed: {{formatDurationSeconds $printerData.PrintTime}}</span>
+                    <span>Remaining: {{formatDurationSeconds $printerData.PrintTimeLeft}}</span>
+                    <span>ETA: {{formatETASeconds $printerData.PrintTimeLeft}}</span>
+                </div>
+            </div>
+            {{end}}
+
             <div class="mapping-section">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                     <h3>Toolhead Mappings</h3>

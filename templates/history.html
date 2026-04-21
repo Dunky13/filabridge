@@ -1,0 +1,55 @@
+<div id="history-tab" class="tab-content">
+    <div class="history-header">
+        <div>
+            <h2>Print History</h2>
+            <p class="history-subtitle">Review completed prints, filament usage, and correct spool assignments after the fact.</p>
+        </div>
+        <button class="btn btn-secondary" onclick="loadPrintHistory()">↻ Refresh</button>
+    </div>
+
+    <div id="history-feedback" class="history-feedback hidden"></div>
+
+    <div class="history-import-panel">
+        <div class="history-import-copy">
+            <h3>Import Prusa Connect JSON</h3>
+            <p>Pick a `.json` export file from Prusa Connect. Imported rows land with unknown spool so you can correct them after backfill.</p>
+        </div>
+        <div class="history-import-grid">
+            <label class="form-group">
+                <span>Printer</span>
+                <select id="history-import-printer" class="history-select"></select>
+            </label>
+            <label class="form-group">
+                <span>Default toolhead</span>
+                <select id="history-import-toolhead" class="history-select"></select>
+            </label>
+            <label class="form-group history-import-file">
+                <span>JSON file</span>
+                <input id="history-import-file" type="file" accept=".json,application/json">
+            </label>
+        </div>
+        <div class="history-import-actions">
+            <button id="history-import-button" class="btn btn-secondary" onclick="importPrintHistory()">Import JSON</button>
+        </div>
+    </div>
+
+    <div class="history-table-wrapper">
+        <table class="history-table">
+            <thead>
+                <tr>
+                    <th class="history-col-finished">Finished</th>
+                    <th class="history-col-used">Used</th>
+                    <th class="history-col-spool">Spool</th>
+                    <th class="history-col-print">Print</th>
+                    <th class="history-col-printer">Printer</th>
+                    <th class="history-col-toolhead">Toolhead</th>
+                </tr>
+            </thead>
+            <tbody id="print-history-body">
+                <tr>
+                    <td colspan="6" class="history-empty">Loading print history...</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</div>

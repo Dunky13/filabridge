@@ -169,8 +169,7 @@ func (spool *SpoolmanSpool) getSpoolDisplayName() string {
 	return fmt.Sprintf("%s - %s - %s", material, brand, name)
 }
 
-// GetAllSpools gets all filament spools from Spoolman
-func (c *SpoolmanClient) GetAllSpools() ([]SpoolmanSpool, error) {
+func (c *SpoolmanClient) getAllSpools(includeEmpty bool) ([]SpoolmanSpool, error) {
 	req, err := http.NewRequest("GET", c.baseURL+"/api/v1/spool", nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
@@ -192,19 +191,20 @@ func (c *SpoolmanClient) GetAllSpools() ([]SpoolmanSpool, error) {
 		return nil, fmt.Errorf("error decoding spools from Spoolman: %w", err)
 	}
 
-	// Normalize spool data to extract information from nested structures
+	// Normalize spool data to extract information from nested structures.
 	for i := range spools {
 		spools[i] = c.normalizeSpoolData(spools[i])
 	}
 
-	// Filter out spools with 0g remaining weight
-	filteredSpools := make([]SpoolmanSpool, 0, len(spools))
-	for _, spool := range spools {
-		if spool.RemainingWeight > 0 {
-			filteredSpools = append(filteredSpools, spool)
+	if !includeEmpty {
+		filteredSpools := make([]SpoolmanSpool, 0, len(spools))
+		for _, spool := range spools {
+			if spool.RemainingWeight > 0 {
+				filteredSpools = append(filteredSpools, spool)
+			}
 		}
+		spools = filteredSpools
 	}
-	spools = filteredSpools
 
 	// Sort spools: first alphabetically by display name, then by remaining weight (descending)
 	sort.Slice(spools, func(i, j int) bool {
@@ -221,6 +221,43 @@ func (c *SpoolmanClient) GetAllSpools() ([]SpoolmanSpool, error) {
 	})
 
 	return spools, nil
+}
+
+// GetAllSpools gets all filament spools from Spoolman
+func (c *SpoolmanClient) GetAllSpools() ([]SpoolmanSpool, error) {
+	return c.getAllSpools(false)
+}
+
+// GetAllSpoolsIncludingEmpty gets all filament spools, including depleted ones.
+func (c *SpoolmanClient) GetAllSpoolsIncludingEmpty() ([]SpoolmanSpool, error) {
+	return c.getAllSpools(true)
+}
+
+// GetSpool gets a single spool by ID from Spoolman.
+func (c *SpoolmanClient) GetSpool(spoolID int) (*SpoolmanSpool, error) {
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/spool/%d", c.baseURL, spoolID), nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+	c.addAuthHeader(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error getting spool %d from Spoolman: %w", spoolID, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("spool %d not found in Spoolman: %w", spoolID, c.handleAPIError(resp))
+	}
+
+	var spool SpoolmanSpool
+	if err := json.NewDecoder(resp.Body).Decode(&spool); err != nil {
+		return nil, fmt.Errorf("error decoding spool %d from Spoolman: %w", spoolID, err)
+	}
+
+	normalized := c.normalizeSpoolData(spool)
+	return &normalized, nil
 }
 
 // GetAllFilaments gets all filament types from Spoolman
@@ -292,30 +329,21 @@ func (c *SpoolmanClient) UpdateSpool(spoolID int, data map[string]interface{}) e
 
 // UpdateSpoolUsage updates spool used weight based on usage (core bridge functionality)
 func (c *SpoolmanClient) UpdateSpoolUsage(spoolID int, filamentUsed float64) error {
-	// Get current spool data
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/spool/%d", c.baseURL, spoolID), nil)
+	return c.AdjustSpoolUsage(spoolID, filamentUsed)
+}
+
+// AdjustSpoolUsage changes spool used weight by a positive or negative amount.
+func (c *SpoolmanClient) AdjustSpoolUsage(spoolID int, filamentDelta float64) error {
+	spool, err := c.GetSpool(spoolID)
 	if err != nil {
-		return fmt.Errorf("error creating request: %w", err)
-	}
-	c.addAuthHeader(req)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("error getting spool %d from Spoolman: %w", spoolID, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("spool %d not found in Spoolman: %w", spoolID, c.handleAPIError(resp))
+		return err
 	}
 
-	var spool SpoolmanSpool
-	if err := json.NewDecoder(resp.Body).Decode(&spool); err != nil {
-		return fmt.Errorf("error decoding spool %d from Spoolman: %w", spoolID, err)
+	newUsedWeight := spool.UsedWeight + filamentDelta
+	if newUsedWeight < 0 {
+		return fmt.Errorf("spool %d used weight would become negative", spoolID)
 	}
 
-	// Calculate new used weight
-	newUsedWeight := spool.UsedWeight + filamentUsed
 	currentTime := time.Now().UTC().Format(time.RFC3339)
 
 	// Update used_weight and timestamps
@@ -325,7 +353,7 @@ func (c *SpoolmanClient) UpdateSpoolUsage(spoolID int, filamentUsed float64) err
 	}
 
 	// Set first_used if it's not already set
-	if spool.FirstUsed == "" {
+	if filamentDelta > 0 && spool.FirstUsed == "" {
 		updateData["first_used"] = currentTime
 	}
 
@@ -334,7 +362,7 @@ func (c *SpoolmanClient) UpdateSpoolUsage(spoolID int, filamentUsed float64) err
 	}
 
 	fmt.Printf("Updated spool %d: used_weight %.2fg -> %.2fg (added %.2fg)\n",
-		spoolID, spool.UsedWeight, newUsedWeight, filamentUsed)
+		spoolID, spool.UsedWeight, newUsedWeight, filamentDelta)
 
 	return nil
 }

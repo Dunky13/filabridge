@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -22,39 +23,14 @@ type PrusaLinkClient struct {
 
 // PrusaLinkStatus represents the status response from PrusaLink
 type PrusaLinkStatus struct {
+	Job struct {
+		ID            int     `json:"id"`
+		Progress      float64 `json:"progress"`
+		TimeRemaining int     `json:"time_remaining"`
+		TimePrinting  int     `json:"time_printing"`
+	} `json:"job"`
 	Printer struct {
-		State       string `json:"state"`
-		Temperature struct {
-			Bed struct {
-				Actual float64 `json:"actual"`
-				Target float64 `json:"target"`
-			} `json:"bed"`
-			Tool0 struct {
-				Actual float64 `json:"actual"`
-				Target float64 `json:"target"`
-			} `json:"tool0"`
-			Tool1 struct {
-				Actual float64 `json:"actual"`
-				Target float64 `json:"target"`
-			} `json:"tool1,omitempty"`
-			Tool2 struct {
-				Actual float64 `json:"actual"`
-				Target float64 `json:"target"`
-			} `json:"tool2,omitempty"`
-			Tool3 struct {
-				Actual float64 `json:"actual"`
-				Target float64 `json:"target"`
-			} `json:"tool3,omitempty"`
-			Tool4 struct {
-				Actual float64 `json:"actual"`
-				Target float64 `json:"target"`
-			} `json:"tool4,omitempty"`
-		} `json:"temperature"`
-		Telemetry struct {
-			PrintTime     int     `json:"print_time"`
-			PrintTimeLeft int     `json:"print_time_left"`
-			Progress      float64 `json:"progress"`
-		} `json:"telemetry"`
+		State string `json:"state"`
 	} `json:"printer"`
 }
 
@@ -66,20 +42,55 @@ type PrusaLinkJob struct {
 	TimeRemaining int     `json:"time_remaining"`
 	TimePrinting  int     `json:"time_printing"`
 	File          struct {
-		Name        string `json:"name"`
-		DisplayName string `json:"display_name"`
-		Path        string `json:"path"`
-		Size        int    `json:"size"`
+		Name        string                     `json:"name"`
+		DisplayName string                     `json:"display_name"`
+		Path        string                     `json:"path"`
+		Size        int                        `json:"size"`
+		Meta        PrusaLinkPrintFileMetadata `json:"meta"`
 		Refs        struct {
 			Download string `json:"download"`
 		} `json:"refs"`
 	} `json:"file"`
-	// Filament usage data (if available)
-	Filament []struct {
-		ToolheadID int     `json:"toolhead_id"`
-		Length     float64 `json:"length"`
-		Weight     float64 `json:"weight"`
-	} `json:"filament,omitempty"`
+}
+
+type PrusaLinkPrintFileMetadata struct {
+	FilamentUsedG        float64   `json:"filament used [g]"`
+	FilamentUsedGPerTool []float64 `json:"filament used [g] per tool"`
+}
+
+type PrusaLinkPrintFileInfo struct {
+	Meta PrusaLinkPrintFileMetadata `json:"meta"`
+}
+
+// FilamentUsageByToolhead converts print file metadata into toolhead-weight mapping.
+func (m PrusaLinkPrintFileMetadata) FilamentUsageByToolhead() map[int]float64 {
+	if len(m.FilamentUsedGPerTool) > 0 {
+		usage := make(map[int]float64, len(m.FilamentUsedGPerTool))
+		for toolheadID, weight := range m.FilamentUsedGPerTool {
+			if weight <= 0 {
+				continue
+			}
+			usage[toolheadID] = weight
+		}
+		if len(usage) > 0 {
+			return usage
+		}
+	}
+
+	if m.FilamentUsedG > 0 {
+		return map[int]float64{0: m.FilamentUsedG}
+	}
+
+	return nil
+}
+
+// FilamentUsageByToolhead converts job file metadata into toolhead-weight mapping.
+func (j *PrusaLinkJob) FilamentUsageByToolhead() map[int]float64 {
+	if j == nil {
+		return nil
+	}
+
+	return j.File.Meta.FilamentUsageByToolhead()
 }
 
 // PrusaLinkInfo represents the printer info response from PrusaLink
@@ -187,6 +198,62 @@ func (c *PrusaLinkClient) GetJobInfo() (*PrusaLinkJob, error) {
 	}
 
 	return &job, nil
+}
+
+func (c *PrusaLinkClient) GetPrintFileInfo(storagePath string) (*PrusaLinkPrintFileInfo, error) {
+	metadataURL, err := c.buildFileMetadataURL(storagePath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("GET", metadataURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create file metadata request: %w", err)
+	}
+
+	c.addAPIKey(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get print file info from PrusaLink: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("PrusaLink API error: %d - %s", resp.StatusCode, string(body))
+	}
+
+	var info PrusaLinkPrintFileInfo
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return nil, fmt.Errorf("failed to decode print file info response: %w", err)
+	}
+
+	return &info, nil
+}
+
+func (c *PrusaLinkClient) GetPrintFileInfoWithRetry(storagePath string) (*PrusaLinkPrintFileInfo, error) {
+	const maxRetries = 3
+	backoffDelays := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		log.Printf("Fetching print file metadata attempt %d/%d: %s", attempt+1, maxRetries, storagePath)
+
+		info, err := c.GetPrintFileInfo(storagePath)
+		if err == nil {
+			return info, nil
+		}
+
+		lastErr = err
+		log.Printf("Metadata attempt %d failed: %v", attempt+1, lastErr)
+		if attempt < maxRetries-1 {
+			time.Sleep(backoffDelays[attempt])
+		}
+	}
+
+	return nil, fmt.Errorf("failed to fetch print file metadata after %d attempts: %w", maxRetries, lastErr)
 }
 
 // GetPrinterInfo retrieves the printer information
@@ -393,4 +460,30 @@ func (c *PrusaLinkClient) ParseGcodeFilamentUsage(gcodeContent []byte) (map[int]
 func (c *PrusaLinkClient) TestConnection() error {
 	_, err := c.GetStatus()
 	return err
+}
+
+func (c *PrusaLinkClient) buildFileMetadataURL(storagePath string) (string, error) {
+	storagePath = strings.TrimPrefix(strings.TrimSpace(storagePath), "/")
+	if storagePath == "" {
+		return "", fmt.Errorf("storage path is empty")
+	}
+
+	parts := strings.Split(storagePath, "/")
+	if len(parts) < 2 {
+		return "", fmt.Errorf("invalid storage path: %s", storagePath)
+	}
+
+	storage := url.PathEscape(parts[0])
+	pathParts := make([]string, 0, len(parts)-1)
+	for _, part := range parts[1:] {
+		if part == "" {
+			continue
+		}
+		pathParts = append(pathParts, url.PathEscape(part))
+	}
+	if len(pathParts) == 0 {
+		return "", fmt.Errorf("invalid storage path: %s", storagePath)
+	}
+
+	return fmt.Sprintf("%s/api/v1/files/%s/%s", c.baseURL, storage, strings.Join(pathParts, "/")), nil
 }
