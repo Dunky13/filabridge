@@ -177,7 +177,7 @@
 
 .history-action {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: start;
   gap: 10px;
   min-width: 0;
@@ -185,7 +185,7 @@
 }
 
 .history-action.has-pending-change {
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
 }
 
 .history-dropdown {
@@ -248,6 +248,12 @@
 .history-save-btn {
   margin: 0;
   flex: 0 0 auto;
+}
+
+.history-pull-btn {
+  margin: 0;
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .history-used-editor {

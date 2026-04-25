@@ -142,6 +142,10 @@ func (b *FilamentBridge) ensurePrintHistoryImportSchema() error {
 			column: "print_state",
 			query:  "ALTER TABLE print_history ADD COLUMN print_state TEXT",
 		},
+		{
+			column: "source_path",
+			query:  "ALTER TABLE print_history ADD COLUMN source_path TEXT",
+		},
 	}
 
 	for _, statement := range alterStatements {
@@ -349,12 +353,13 @@ func (b *FilamentBridge) ImportPrusaConnectPrintHistory(printerID string, defaul
 					print_started,
 					print_finished,
 					job_name,
+					source_path,
 					import_source,
 					external_job_id,
 					external_lifetime_id,
 					external_printer_uuid,
 					print_state
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			`,
 				printerConfig.Name,
 				toolheadID,
@@ -363,6 +368,7 @@ func (b *FilamentBridge) ImportPrusaConnectPrintHistory(printerID string, defaul
 				printStarted,
 				printFinished,
 				jobName,
+				strings.TrimSpace(job.Path),
 				printHistoryImportSourcePrusaConnect,
 				job.ExternalJobID(),
 				strings.TrimSpace(job.LifetimeID),

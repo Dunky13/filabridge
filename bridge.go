@@ -50,6 +50,7 @@ type PrintHistory struct {
 	PrintStarted  time.Time `json:"print_started"`
 	PrintFinished time.Time `json:"print_finished"`
 	JobName       string    `json:"job_name"`
+	SourcePath    string    `json:"source_path,omitempty"`
 }
 
 // PrintError represents a failed print processing attempt
@@ -157,6 +158,7 @@ func (b *FilamentBridge) initDatabase() error {
 			print_started TIMESTAMP,
 			print_finished TIMESTAMP,
 			job_name TEXT,
+			source_path TEXT,
 			import_source TEXT NOT NULL DEFAULT 'runtime',
 			external_job_id TEXT,
 			external_lifetime_id TEXT,
@@ -1064,6 +1066,11 @@ func cloneIntPointer(value *int) *int {
 
 // LogPrintUsage logs filament usage for a print job
 func (b *FilamentBridge) LogPrintUsage(printerName string, toolheadID int, spoolID *int, filamentUsed float64, jobName string) error {
+	return b.LogPrintUsageWithSourcePath(printerName, toolheadID, spoolID, filamentUsed, jobName, "")
+}
+
+// LogPrintUsageWithSourcePath logs filament usage and retains the printer file path when known.
+func (b *FilamentBridge) LogPrintUsageWithSourcePath(printerName string, toolheadID int, spoolID *int, filamentUsed float64, jobName string, sourcePath string) error {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
@@ -1076,8 +1083,8 @@ func (b *FilamentBridge) LogPrintUsage(printerName string, toolheadID int, spool
 	}
 
 	_, err := b.db.Exec(
-		"INSERT INTO print_history (printer_name, toolhead_id, spool_id, filament_used, print_started, print_finished, job_name) VALUES (?, ?, ?, ?, ?, ?, ?)",
-		printerName, toolheadID, spoolID, filamentUsed, printStarted, time.Now(), jobName,
+		"INSERT INTO print_history (printer_name, toolhead_id, spool_id, filament_used, print_started, print_finished, job_name, source_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		printerName, toolheadID, spoolID, filamentUsed, printStarted, time.Now(), jobName, strings.TrimSpace(sourcePath),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to log print usage: %w", err)
@@ -1115,7 +1122,7 @@ func (b *FilamentBridge) GetPrintHistory(limit int) ([]PrintHistory, error) {
 	}
 
 	rows, err := b.db.Query(`
-		SELECT id, printer_name, toolhead_id, spool_id, filament_used, print_started, print_finished, job_name
+		SELECT id, printer_name, toolhead_id, spool_id, filament_used, print_started, print_finished, job_name, source_path
 		FROM print_history
 		ORDER BY print_finished DESC, id DESC
 		LIMIT ?
@@ -1129,6 +1136,7 @@ func (b *FilamentBridge) GetPrintHistory(limit int) ([]PrintHistory, error) {
 	for rows.Next() {
 		var entry PrintHistory
 		var spoolID sql.NullInt64
+		var sourcePath sql.NullString
 		if err := rows.Scan(
 			&entry.ID,
 			&entry.PrinterName,
@@ -1138,6 +1146,7 @@ func (b *FilamentBridge) GetPrintHistory(limit int) ([]PrintHistory, error) {
 			&entry.PrintStarted,
 			&entry.PrintFinished,
 			&entry.JobName,
+			&sourcePath,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan print history row: %w", err)
 		}
@@ -1145,6 +1154,9 @@ func (b *FilamentBridge) GetPrintHistory(limit int) ([]PrintHistory, error) {
 		if spoolID.Valid {
 			value := int(spoolID.Int64)
 			entry.SpoolID = &value
+		}
+		if sourcePath.Valid {
+			entry.SourcePath = sourcePath.String
 		}
 
 		entry.ToolheadName = b.getToolheadDisplayName(entry.PrinterName, entry.ToolheadID)
@@ -1161,8 +1173,9 @@ func (b *FilamentBridge) GetPrintHistory(limit int) ([]PrintHistory, error) {
 func (b *FilamentBridge) getPrintHistoryByID(historyID int) (*PrintHistory, error) {
 	var entry PrintHistory
 	var spoolID sql.NullInt64
+	var sourcePath sql.NullString
 	err := b.db.QueryRow(`
-		SELECT id, printer_name, toolhead_id, spool_id, filament_used, print_started, print_finished, job_name
+		SELECT id, printer_name, toolhead_id, spool_id, filament_used, print_started, print_finished, job_name, source_path
 		FROM print_history
 		WHERE id = ?
 	`, historyID).Scan(
@@ -1174,6 +1187,7 @@ func (b *FilamentBridge) getPrintHistoryByID(historyID int) (*PrintHistory, erro
 		&entry.PrintStarted,
 		&entry.PrintFinished,
 		&entry.JobName,
+		&sourcePath,
 	)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("print history entry %d not found", historyID)
@@ -1186,9 +1200,112 @@ func (b *FilamentBridge) getPrintHistoryByID(historyID int) (*PrintHistory, erro
 		value := int(spoolID.Int64)
 		entry.SpoolID = &value
 	}
+	if sourcePath.Valid {
+		entry.SourcePath = sourcePath.String
+	}
 
 	entry.ToolheadName = b.getToolheadDisplayName(entry.PrinterName, entry.ToolheadID)
 	return &entry, nil
+}
+
+func (b *FilamentBridge) setPrintHistorySourcePath(historyID int, sourcePath string) error {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+
+	_, err := b.db.Exec("UPDATE print_history SET source_path = ? WHERE id = ?", strings.TrimSpace(sourcePath), historyID)
+	if err != nil {
+		return fmt.Errorf("failed to update print history source path for entry %d: %w", historyID, err)
+	}
+
+	return nil
+}
+
+func (b *FilamentBridge) getPrinterConfigByName(printerName string) (string, PrinterConfig, error) {
+	printerConfigs, err := b.GetAllPrinterConfigs()
+	if err != nil {
+		return "", PrinterConfig{}, fmt.Errorf("failed to get printer configs: %w", err)
+	}
+
+	for printerID, printerConfig := range printerConfigs {
+		if printerConfig.Name == printerName {
+			return printerID, printerConfig, nil
+		}
+	}
+
+	return "", PrinterConfig{}, fmt.Errorf("printer %s not found", printerName)
+}
+
+func selectHistoryFilamentUsage(toolheadID int, filamentUsage map[int]float64) (float64, error) {
+	if len(filamentUsage) == 0 {
+		return 0, fmt.Errorf("no filament usage data returned from printer")
+	}
+	if weight, exists := filamentUsage[toolheadID]; exists && weight > 0 {
+		return weight, nil
+	}
+	if len(filamentUsage) == 1 {
+		for _, weight := range filamentUsage {
+			if weight > 0 {
+				return weight, nil
+			}
+		}
+	}
+
+	return 0, fmt.Errorf("printer returned filament usage for different toolheads: %+v", filamentUsage)
+}
+
+func (b *FilamentBridge) RefreshPrintHistoryFilamentUsage(historyID int, spoolID *int) (*PrintHistory, error) {
+	entry, err := b.getPrintHistoryByID(historyID)
+	if err != nil {
+		return nil, err
+	}
+
+	_, printerConfig, err := b.getPrinterConfigByName(entry.PrinterName)
+	if err != nil {
+		return nil, err
+	}
+
+	prusaClient := NewPrusaLinkClient(printerConfig.IPAddress, printerConfig.APIKey, b.config.PrusaLinkTimeout, b.config.PrusaLinkFileDownloadTimeout)
+
+	sourcePath := strings.TrimSpace(entry.SourcePath)
+	if sourcePath == "" {
+		sourcePath, err = prusaClient.FindStoragePathForJobName(entry.JobName)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	filamentUsage, err := prusaClient.GetFilamentUsageForFile(sourcePath)
+	if err != nil {
+		return nil, err
+	}
+
+	pulledWeight, err := selectHistoryFilamentUsage(entry.ToolheadID, filamentUsage)
+	if err != nil {
+		return nil, err
+	}
+
+	if strings.TrimSpace(entry.SourcePath) != sourcePath {
+		if err := b.setPrintHistorySourcePath(historyID, sourcePath); err != nil {
+			return nil, err
+		}
+	}
+
+	targetSpoolID := spoolID
+	if targetSpoolID == nil {
+		targetSpoolID = entry.SpoolID
+	}
+
+	if err := b.UpdatePrintHistory(historyID, targetSpoolID, pulledWeight); err != nil {
+		return nil, err
+	}
+
+	updatedEntry, err := b.getPrintHistoryByID(historyID)
+	if err != nil {
+		return nil, err
+	}
+	updatedEntry.SourcePath = sourcePath
+
+	return updatedEntry, nil
 }
 
 // UpdatePrintHistory corrects spool assignment and/or filament usage for an existing print.
@@ -1448,7 +1565,7 @@ func (b *FilamentBridge) handlePrusaLinkPrintFinished(config PrinterConfig, stor
 		resolvedUsage, err := prusaClient.GetFilamentUsageForFile(storagePath)
 		if err != nil {
 			errorMsg := fmt.Sprintf("failed to extract filament usage from PrusaLink: %v", err)
-			return b.logPrintHistoryWithoutUsage(printerName, config, jobName, errorMsg)
+			return b.logPrintHistoryWithoutUsage(printerName, config, storagePath, jobName, errorMsg)
 		}
 
 		filamentUsage = resolvedUsage
@@ -1457,13 +1574,13 @@ func (b *FilamentBridge) handlePrusaLinkPrintFinished(config PrinterConfig, stor
 	// Check if we got any filament usage data
 	if len(filamentUsage) == 0 {
 		errorMsg := "no filament usage data found in PrusaLink metadata"
-		return b.logPrintHistoryWithoutUsage(printerName, config, jobName, errorMsg)
+		return b.logPrintHistoryWithoutUsage(printerName, config, storagePath, jobName, errorMsg)
 	}
 
 	log.Printf("Successfully collected filament usage: %+v", filamentUsage)
 
 	// Process filament usage using helper function
-	if err := b.processFilamentUsage(printerName, filamentUsage, jobName); err != nil {
+	if err := b.processFilamentUsage(printerName, filamentUsage, jobName, storagePath); err != nil {
 		log.Printf("Error processing filament usage: %v", err)
 		return err
 	}
@@ -1471,11 +1588,11 @@ func (b *FilamentBridge) handlePrusaLinkPrintFinished(config PrinterConfig, stor
 	return nil
 }
 
-func (b *FilamentBridge) logPrintHistoryWithoutUsage(printerName string, config PrinterConfig, jobName string, errorMsg string) error {
+func (b *FilamentBridge) logPrintHistoryWithoutUsage(printerName string, config PrinterConfig, sourcePath string, jobName string, errorMsg string) error {
 	b.addPrintError(printerName, jobName, errorMsg)
 
 	toolheadID, spoolID := b.getBestEffortHistoryTarget(printerName, config)
-	if err := b.LogPrintUsage(printerName, toolheadID, spoolID, 0, jobName); err != nil {
+	if err := b.LogPrintUsageWithSourcePath(printerName, toolheadID, spoolID, 0, jobName, sourcePath); err != nil {
 		return fmt.Errorf("failed to log print without filament usage: %w", err)
 	}
 
@@ -1767,7 +1884,7 @@ func (b *FilamentBridge) GetStatus() (*PrinterStatus, error) {
 }
 
 // processFilamentUsage processes filament usage updates for all toolheads
-func (b *FilamentBridge) processFilamentUsage(printerName string, filamentUsage map[int]float64, jobName string) error {
+func (b *FilamentBridge) processFilamentUsage(printerName string, filamentUsage map[int]float64, jobName string, sourcePath string) error {
 	// Update Spoolman with filament usage for each toolhead
 	for toolheadID, usedWeight := range filamentUsage {
 		if usedWeight <= 0 {
@@ -1797,7 +1914,7 @@ func (b *FilamentBridge) processFilamentUsage(printerName string, filamentUsage 
 		}
 
 		// Log the usage in our database
-		if err := b.LogPrintUsage(printerName, toolheadID, historySpoolID, usedWeight, jobName); err != nil {
+		if err := b.LogPrintUsageWithSourcePath(printerName, toolheadID, historySpoolID, usedWeight, jobName, sourcePath); err != nil {
 			log.Printf("Error logging print usage: %v", err)
 		}
 

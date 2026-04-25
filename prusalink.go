@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,6 +22,8 @@ type PrusaLinkClient struct {
 	httpClient          *http.Client
 	fileDownloadTimeout int
 }
+
+const prusaLinkDownloadSniffBytes = 256 * 1024
 
 // PrusaLinkStatus represents the status response from PrusaLink
 type PrusaLinkStatus struct {
@@ -62,7 +65,23 @@ type PrusaLinkPrintFileMetadata struct {
 }
 
 type PrusaLinkPrintFileInfo struct {
-	Meta PrusaLinkPrintFileMetadata `json:"meta"`
+	Name        string                     `json:"name"`
+	DisplayName string                     `json:"display_name"`
+	Path        string                     `json:"path"`
+	Meta        PrusaLinkPrintFileMetadata `json:"meta"`
+	Refs        struct {
+		Download string `json:"download"`
+	} `json:"refs"`
+}
+
+type PrusaLinkStorageResponse struct {
+	StorageList []PrusaLinkStorage `json:"storage_list"`
+}
+
+type PrusaLinkStorage struct {
+	Path      string `json:"path"`
+	Available bool   `json:"available"`
+	Type      string `json:"type"`
 }
 
 // FilamentUsageByToolhead converts print file metadata into toolhead-weight mapping.
@@ -270,6 +289,44 @@ func (c *PrusaLinkClient) GetPrintFileInfoWithRetry(storagePath string) (*PrusaL
 	return nil, fmt.Errorf("failed to fetch print file metadata after %d attempts: %w", maxRetries, lastErr)
 }
 
+func (c *PrusaLinkClient) GetStoragePaths() ([]string, error) {
+	req, err := http.NewRequest("GET", c.baseURL+"/api/v1/storage", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create storage request: %w", err)
+	}
+
+	c.addAPIKey(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get storage info from PrusaLink: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("PrusaLink API error: %d - %s", resp.StatusCode, string(body))
+	}
+
+	var storageResponse PrusaLinkStorageResponse
+	if err := json.NewDecoder(resp.Body).Decode(&storageResponse); err != nil {
+		return nil, fmt.Errorf("failed to decode storage response: %w", err)
+	}
+
+	paths := make([]string, 0, len(storageResponse.StorageList))
+	for _, storage := range storageResponse.StorageList {
+		if !storage.Available {
+			continue
+		}
+		path := strings.Trim(strings.TrimSpace(storage.Path), "/")
+		if path != "" {
+			paths = append(paths, path)
+		}
+	}
+
+	return paths, nil
+}
+
 // GetFilamentUsageForFile retrieves filament usage from PrusaLink metadata, then falls back
 // to downloading and parsing the print file when metadata is missing or unavailable.
 func (c *PrusaLinkClient) GetFilamentUsageForFile(storagePath string) (map[int]float64, error) {
@@ -283,20 +340,17 @@ func (c *PrusaLinkClient) GetFilamentUsageForFile(storagePath string) (map[int]f
 		log.Printf("Metadata fetch failed for %s, falling back to file parse: %v", storagePath, metadataErr)
 	}
 
-	gcodeContent, downloadErr := c.GetGcodeFileWithRetry(storagePath, c.fileDownloadTimeout)
+	downloadRef := ""
+	if info != nil {
+		downloadRef = info.Refs.Download
+	}
+
+	filamentUsage, downloadErr := c.GetFilamentUsageFromDownloadWithRetry(storagePath, downloadRef, c.fileDownloadTimeout)
 	if downloadErr != nil {
 		if metadataErr != nil {
 			return nil, fmt.Errorf("metadata fetch failed: %w; file download fallback failed: %v", metadataErr, downloadErr)
 		}
 		return nil, fmt.Errorf("failed to download print file for filament usage fallback: %w", downloadErr)
-	}
-
-	filamentUsage, parseErr := c.ParseGcodeFilamentUsage(gcodeContent)
-	if parseErr != nil {
-		if metadataErr != nil {
-			return nil, fmt.Errorf("metadata fetch failed: %w; file parse fallback failed: %v", metadataErr, parseErr)
-		}
-		return nil, fmt.Errorf("failed to parse print file for filament usage fallback: %w", parseErr)
 	}
 	if len(filamentUsage) == 0 {
 		if metadataErr != nil {
@@ -306,6 +360,56 @@ func (c *PrusaLinkClient) GetFilamentUsageForFile(storagePath string) (map[int]f
 	}
 
 	return filamentUsage, nil
+}
+
+func (c *PrusaLinkClient) FindStoragePathForJobName(jobName string) (string, error) {
+	jobName = strings.Trim(strings.TrimSpace(jobName), "/")
+	if jobName == "" {
+		return "", fmt.Errorf("job name is empty")
+	}
+
+	tryPaths := make([]string, 0, 4)
+	seen := make(map[string]struct{})
+	addTryPath := func(candidate string) {
+		candidate = strings.Trim(strings.TrimSpace(candidate), "/")
+		if candidate == "" {
+			return
+		}
+		if _, exists := seen[candidate]; exists {
+			return
+		}
+		seen[candidate] = struct{}{}
+		tryPaths = append(tryPaths, candidate)
+	}
+
+	if strings.Count(jobName, "/") >= 1 {
+		addTryPath(jobName)
+	}
+
+	storagePaths, err := c.GetStoragePaths()
+	if err != nil {
+		return "", err
+	}
+
+	for _, storagePath := range storagePaths {
+		addTryPath(joinPrusaStoragePath(storagePath, jobName))
+		addTryPath(joinPrusaStoragePath(storagePath, prusaPathBase(jobName)))
+	}
+
+	var lastErr error
+	for _, candidate := range tryPaths {
+		_, err := c.GetPrintFileInfo(candidate)
+		if err == nil {
+			return candidate, nil
+		}
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		return "", fmt.Errorf("failed to resolve printer file for %s: %w", jobName, lastErr)
+	}
+
+	return "", fmt.Errorf("failed to resolve printer file for %s", jobName)
 }
 
 // GetPrinterInfo retrieves the printer information
@@ -385,15 +489,90 @@ func (c *PrusaLinkClient) GetGcodeFile(filename string) ([]byte, error) {
 	return body, nil
 }
 
-// GetGcodeFileWithRetry downloads the G-code file with retry logic and exponential backoff
-func (c *PrusaLinkClient) GetGcodeFileWithRetry(filename string, fileDownloadTimeout int) ([]byte, error) {
+// GetFilamentUsageFromDownloadWithRetry downloads only as much of the print file as needed
+// to extract the "filament used [g]" line, avoiding full bgcode transfers on flaky links.
+func (c *PrusaLinkClient) GetFilamentUsageFromDownloadWithRetry(storagePath string, downloadRef string, fileDownloadTimeout int) (map[int]float64, error) {
 	const maxRetries = 3
 	backoffDelays := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
 
 	var lastErr error
+	candidates := c.buildFileDownloadURLCandidates(storagePath, downloadRef)
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no download URL candidates available for %s", storagePath)
+	}
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		log.Printf("Downloading G-code file attempt %d/%d: %s", attempt+1, maxRetries, filename)
+		log.Printf("Downloading G-code file attempt %d/%d: %s", attempt+1, maxRetries, storagePath)
+
+		fileDialer := &net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+
+		fileClient := &http.Client{
+			Timeout: time.Duration(fileDownloadTimeout) * time.Second,
+			Transport: &http.Transport{
+				DialContext:           fileDialer.DialContext,
+				MaxIdleConns:          10,
+				MaxIdleConnsPerHost:   2,
+				IdleConnTimeout:       90 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
+		}
+
+		log.Printf("File download client configured with %v timeout", fileClient.Timeout)
+
+		for _, candidateURL := range candidates {
+			filamentUsage, err := c.tryDownloadFilamentUsage(fileClient, candidateURL, true)
+			if err == nil && len(filamentUsage) > 0 {
+				log.Printf("Successfully extracted filament usage on attempt %d: %s -> %+v",
+					attempt+1, candidateURL, filamentUsage)
+				return filamentUsage, nil
+			}
+			if err != nil {
+				lastErr = err
+				log.Printf("Attempt %d candidate failed: %v", attempt+1, lastErr)
+				continue
+			}
+
+			// Range request succeeded but did not include the metadata line. Fall back to full stream parse.
+			filamentUsage, err = c.tryDownloadFilamentUsage(fileClient, candidateURL, false)
+			if err == nil && len(filamentUsage) > 0 {
+				log.Printf("Successfully extracted filament usage on attempt %d with full download: %s -> %+v",
+					attempt+1, candidateURL, filamentUsage)
+				return filamentUsage, nil
+			}
+			if err != nil {
+				lastErr = err
+				log.Printf("Attempt %d full-download candidate failed: %v", attempt+1, lastErr)
+				continue
+			}
+
+			lastErr = fmt.Errorf("no filament usage found in download stream from %s", candidateURL)
+		}
+
+		if attempt < maxRetries-1 {
+			time.Sleep(backoffDelays[attempt])
+		}
+	}
+
+	return nil, fmt.Errorf("failed to download G-code file after %d attempts: %w", maxRetries, lastErr)
+}
+
+// GetGcodeFileWithRetry downloads the G-code file with retry logic and exponential backoff
+func (c *PrusaLinkClient) GetGcodeFileWithRetry(storagePath string, downloadRef string, fileDownloadTimeout int) ([]byte, error) {
+	const maxRetries = 3
+	backoffDelays := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+	var lastErr error
+	candidates := c.buildFileDownloadURLCandidates(storagePath, downloadRef)
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("no download URL candidates available for %s", storagePath)
+	}
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		log.Printf("Downloading G-code file attempt %d/%d: %s", attempt+1, maxRetries, storagePath)
 
 		// Create a new client with extended timeout for file downloads
 		// Use the same DNS timeout configuration for consistency
@@ -417,56 +596,51 @@ func (c *PrusaLinkClient) GetGcodeFileWithRetry(filename string, fileDownloadTim
 		// Add diagnostic logging to verify timeout values
 		log.Printf("File download client configured with %v timeout", fileClient.Timeout)
 
-		// Use the correct PrusaLink API format: /{filename}
-		req, err := http.NewRequest("GET", c.baseURL+"/"+filename, nil)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to create G-code request: %w", err)
-			log.Printf("Attempt %d failed: %v", attempt+1, lastErr)
-			if attempt < maxRetries-1 {
-				time.Sleep(backoffDelays[attempt])
+		for _, candidateURL := range candidates {
+			log.Printf("Attempting G-code download from %s", candidateURL)
+
+			req, err := http.NewRequest("GET", candidateURL, nil)
+			if err != nil {
+				lastErr = fmt.Errorf("failed to create G-code request: %w", err)
+				log.Printf("Attempt %d candidate failed: %v", attempt+1, lastErr)
+				continue
 			}
-			continue
-		}
 
-		// Add API key authentication
-		c.addAPIKey(req)
+			// Add API key authentication
+			c.addAPIKey(req)
 
-		resp, err := fileClient.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("failed to get G-code file from PrusaLink: %w", err)
-			log.Printf("Attempt %d failed: %v", attempt+1, lastErr)
-			if attempt < maxRetries-1 {
-				time.Sleep(backoffDelays[attempt])
+			resp, err := fileClient.Do(req)
+			if err != nil {
+				lastErr = fmt.Errorf("failed to get G-code file from PrusaLink: %w", err)
+				log.Printf("Attempt %d candidate failed: %v", attempt+1, lastErr)
+				continue
 			}
-			continue
-		}
 
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				lastErr = fmt.Errorf("PrusaLink API error: %d - %s", resp.StatusCode, string(body))
+				log.Printf("Attempt %d candidate failed: %v", attempt+1, lastErr)
+				continue
+			}
+
+			body, err := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastErr = fmt.Errorf("PrusaLink API error: %d - %s", resp.StatusCode, string(body))
-			log.Printf("Attempt %d failed: %v", attempt+1, lastErr)
-			if attempt < maxRetries-1 {
-				time.Sleep(backoffDelays[attempt])
+			if err != nil {
+				lastErr = fmt.Errorf("failed to read G-code file: %w", err)
+				log.Printf("Attempt %d candidate failed: %v", attempt+1, lastErr)
+				continue
 			}
-			continue
+
+			// Success!
+			log.Printf("Successfully downloaded G-code file on attempt %d: %s (%d bytes)",
+				attempt+1, candidateURL, len(body))
+			return body, nil
 		}
 
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("failed to read G-code file: %w", err)
-			log.Printf("Attempt %d failed: %v", attempt+1, lastErr)
-			if attempt < maxRetries-1 {
-				time.Sleep(backoffDelays[attempt])
-			}
-			continue
+		if attempt < maxRetries-1 {
+			time.Sleep(backoffDelays[attempt])
 		}
-
-		// Success!
-		log.Printf("Successfully downloaded G-code file on attempt %d: %s (%d bytes)",
-			attempt+1, filename, len(body))
-		return body, nil
 	}
 
 	return nil, fmt.Errorf("failed to download G-code file after %d attempts: %w", maxRetries, lastErr)
@@ -474,38 +648,7 @@ func (c *PrusaLinkClient) GetGcodeFileWithRetry(filename string, fileDownloadTim
 
 // ParseGcodeFilamentUsage extracts filament usage from .gcode or .bgcode content
 func (c *PrusaLinkClient) ParseGcodeFilamentUsage(gcodeContent []byte) (map[int]float64, error) {
-	content := string(gcodeContent)
-	filamentUsage := make(map[int]float64)
-
-	// Parse both .gcode and .bgcode formats
-	// Look for "filament used [g]=" pattern which gives exact weights per toolhead
-	// Pattern handles:
-	//   - .bgcode format: "filament used [g]=1.23,4.56"
-	//   - .gcode format: "; filament used [g] = 1.23, 4.56" (with semicolon and spaces)
-	gcodeRegex := regexp.MustCompile(`;?\s*filament used \[g\]\s*=\s*([0-9.,\s]+)`)
-	gcodeMatch := gcodeRegex.FindStringSubmatch(content)
-
-	if len(gcodeMatch) >= 2 {
-		// Parse the comma-separated values for each toolhead
-		weightsStr := gcodeMatch[1]
-		weights := strings.Split(weightsStr, ",")
-
-		for i, weightStr := range weights {
-			weightStr = strings.TrimSpace(weightStr)
-			if weight, err := strconv.ParseFloat(weightStr, 64); err == nil && weight > 0 {
-				filamentUsage[i] = weight
-			}
-		}
-
-		if len(filamentUsage) > 0 {
-			return filamentUsage, nil
-		}
-	}
-
-	// If no filament usage data found, return empty usage
-	// Both .gcode and .bgcode files should contain this metadata when generated by slicers
-
-	return filamentUsage, nil
+	return c.ParseGcodeFilamentUsageFromReader(bytes.NewReader(gcodeContent))
 }
 
 // TestConnection tests the connection to PrusaLink
@@ -538,4 +681,148 @@ func (c *PrusaLinkClient) buildFileMetadataURL(storagePath string) (string, erro
 	}
 
 	return fmt.Sprintf("%s/api/v1/files/%s/%s", c.baseURL, storage, strings.Join(pathParts, "/")), nil
+}
+
+func (c *PrusaLinkClient) buildFileDownloadURLCandidates(storagePath string, downloadRef string) []string {
+	candidates := make([]string, 0, 3)
+	seen := make(map[string]struct{})
+
+	addCandidate := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+
+		candidateURL := value
+		if !strings.HasPrefix(candidateURL, "http://") && !strings.HasPrefix(candidateURL, "https://") {
+			candidateURL = c.baseURL + "/" + strings.TrimPrefix(candidateURL, "/")
+		}
+		if _, exists := seen[candidateURL]; exists {
+			return
+		}
+		seen[candidateURL] = struct{}{}
+		candidates = append(candidates, candidateURL)
+	}
+
+	addCandidate(downloadRef)
+
+	if rawURL, err := c.buildRawFileDownloadURL(storagePath); err == nil {
+		addCandidate(rawURL)
+	}
+
+	addCandidate("/" + strings.TrimPrefix(strings.TrimSpace(storagePath), "/"))
+
+	return candidates
+}
+
+func (c *PrusaLinkClient) buildRawFileDownloadURL(storagePath string) (string, error) {
+	storagePath = strings.TrimPrefix(strings.TrimSpace(storagePath), "/")
+	if storagePath == "" {
+		return "", fmt.Errorf("storage path is empty")
+	}
+
+	parts := strings.Split(storagePath, "/")
+	if len(parts) < 2 {
+		return "", fmt.Errorf("invalid storage path: %s", storagePath)
+	}
+
+	storage := url.PathEscape(parts[0])
+	pathParts := make([]string, 0, len(parts)-1)
+	for _, part := range parts[1:] {
+		if part == "" {
+			continue
+		}
+		pathParts = append(pathParts, url.PathEscape(part))
+	}
+	if len(pathParts) == 0 {
+		return "", fmt.Errorf("invalid storage path: %s", storagePath)
+	}
+
+	return fmt.Sprintf("%s/api/files/%s/%s/raw", c.baseURL, storage, strings.Join(pathParts, "/")), nil
+}
+
+func (c *PrusaLinkClient) ParseGcodeFilamentUsageFromReader(reader io.Reader) (map[int]float64, error) {
+	const chunkSize = 4096
+	const carryBytes = 512
+
+	rolling := make([]byte, 0, carryBytes+chunkSize)
+	chunk := make([]byte, chunkSize)
+
+	for {
+		readCount, err := reader.Read(chunk)
+		if readCount > 0 {
+			rolling = append(rolling, chunk[:readCount]...)
+
+			if usage := parseFilamentUsageFromContent(string(rolling)); len(usage) > 0 {
+				return usage, nil
+			}
+
+			if len(rolling) > carryBytes {
+				rolling = append([]byte(nil), rolling[len(rolling)-carryBytes:]...)
+			}
+		}
+
+		if err == io.EOF {
+			return nil, nil
+		}
+		if err != nil {
+			if usage := parseFilamentUsageFromContent(string(rolling)); len(usage) > 0 {
+				return usage, nil
+			}
+			return nil, fmt.Errorf("failed to read G-code stream: %w", err)
+		}
+	}
+}
+
+func (c *PrusaLinkClient) tryDownloadFilamentUsage(fileClient *http.Client, candidateURL string, useRange bool) (map[int]float64, error) {
+	req, err := http.NewRequest("GET", candidateURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create G-code request: %w", err)
+	}
+	if useRange {
+		req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", prusaLinkDownloadSniffBytes-1))
+	}
+
+	c.addAPIKey(req)
+
+	resp, err := fileClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get G-code file from PrusaLink: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("PrusaLink API error: %d - %s", resp.StatusCode, string(body))
+	}
+
+	return c.ParseGcodeFilamentUsageFromReader(resp.Body)
+}
+
+func parseFilamentUsageFromContent(content string) map[int]float64 {
+	filamentUsage := make(map[int]float64)
+
+	// Parse both .gcode and .bgcode formats.
+	// Examples:
+	//   "filament used [g]=29.19"
+	//   "; filament used [g] = 1.23, 4.56"
+	gcodeRegex := regexp.MustCompile(`;?\s*filament used \[g\]\s*=\s*([0-9.,\s]+)`)
+	gcodeMatch := gcodeRegex.FindStringSubmatch(content)
+	if len(gcodeMatch) < 2 {
+		return nil
+	}
+
+	weightsStr := gcodeMatch[1]
+	weights := strings.Split(weightsStr, ",")
+	for i, weightStr := range weights {
+		weightStr = strings.TrimSpace(weightStr)
+		if weight, err := strconv.ParseFloat(weightStr, 64); err == nil && weight > 0 {
+			filamentUsage[i] = weight
+		}
+	}
+	if len(filamentUsage) == 0 {
+		return nil
+	}
+
+	return filamentUsage
 }

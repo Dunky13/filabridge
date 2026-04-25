@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -148,6 +149,7 @@ func (ws *WebServer) setupRoutes() {
 		api.POST("/print-history/import", ws.importPrintHistoryHandler)
 		api.PUT("/print-history/:id", ws.updatePrintHistoryHandler)
 		api.PUT("/print-history/:id/spool", ws.updatePrintHistoryHandler)
+		api.POST("/print-history/:id/pull", ws.pullPrintHistoryHandler)
 		api.GET("/filaments", ws.filamentsHandler)
 		api.POST("/map_toolhead", ws.mapToolheadHandler)
 		api.GET("/available_spools", ws.availableSpoolsHandler)
@@ -542,6 +544,38 @@ func (ws *WebServer) updatePrintHistoryHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Print history updated successfully"})
+}
+
+func (ws *WebServer) pullPrintHistoryHandler(c *gin.Context) {
+	historyID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || historyID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid print history id"})
+		return
+	}
+
+	var req struct {
+		SpoolID *int `json:"spool_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
+		return
+	}
+
+	if req.SpoolID != nil && *req.SpoolID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "spool_id must be greater than 0"})
+		return
+	}
+
+	entry, err := ws.bridge.RefreshPrintHistoryFilamentUsage(historyID, req.SpoolID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Print history refreshed successfully",
+		"entry":   entry,
+	})
 }
 
 func (ws *WebServer) importPrintHistoryHandler(c *gin.Context) {
@@ -1247,7 +1281,7 @@ func (ws *WebServer) testPrintCompleteHandler(c *gin.Context) {
 	printerName := resolvePrinterName(config)
 
 	// Process filament usage using helper function
-	if err := ws.bridge.processFilamentUsage(printerName, request.FilamentUsage, request.JobName); err != nil {
+	if err := ws.bridge.processFilamentUsage(printerName, request.FilamentUsage, request.JobName, ""); err != nil {
 		log.Printf("Error processing filament usage: %v", err)
 	}
 

@@ -489,7 +489,7 @@ func TestProcessFilamentUsageLogsUnknownSpoolWhenToolheadUnmapped(t *testing.T) 
 
 	bridge := newTestBridge(t, spoolman.server.URL)
 
-	if err := bridge.processFilamentUsage("Printer A", map[int]float64{0: 8.5}, "unknown.gcode"); err != nil {
+	if err := bridge.processFilamentUsage("Printer A", map[int]float64{0: 8.5}, "unknown.gcode", "usb/unknown.gcode"); err != nil {
 		t.Fatalf("processFilamentUsage() error = %v", err)
 	}
 
@@ -585,5 +585,112 @@ func TestMonitorPrusaLinkUsesDisplayNameForFinishedHistory(t *testing.T) {
 	}
 	if history[0].JobName != "merged-widget.bgcode" {
 		t.Fatalf("history job name = %q, want %q", history[0].JobName, "merged-widget.bgcode")
+	}
+}
+
+func TestRefreshPrintHistoryFilamentUsageUsesStoredSourcePath(t *testing.T) {
+	spoolman := newHistoryTestSpoolmanServer()
+	defer spoolman.close()
+
+	prusaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/files/usb/test.bgcode":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"meta":{},"refs":{"download":"/api/files/usb/test.bgcode/raw"}}`)
+		case "/api/files/usb/test.bgcode/raw":
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte("junk\nfilament used [g]=29.19\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer prusaServer.Close()
+
+	bridge := newTestBridge(t, spoolman.server.URL)
+
+	if err := bridge.SavePrinterConfig("printer-a", PrinterConfig{
+		Name:      "Printer A",
+		Model:     ModelCoreOne,
+		IPAddress: strings.TrimPrefix(prusaServer.URL, "http://"),
+		Toolheads: 1,
+	}); err != nil {
+		t.Fatalf("SavePrinterConfig() error = %v", err)
+	}
+
+	if err := bridge.spoolman.AdjustSpoolUsage(20, 12.5); err != nil {
+		t.Fatalf("AdjustSpoolUsage() error = %v", err)
+	}
+	if err := bridge.LogPrintUsageWithSourcePath("Printer A", 0, historyIntPointer(20), 12.5, "test.bgcode", "usb/test.bgcode"); err != nil {
+		t.Fatalf("LogPrintUsageWithSourcePath() error = %v", err)
+	}
+
+	history, err := bridge.GetPrintHistory(10)
+	if err != nil {
+		t.Fatalf("GetPrintHistory() error = %v", err)
+	}
+
+	updatedEntry, err := bridge.RefreshPrintHistoryFilamentUsage(history[0].ID, historyIntPointer(20))
+	if err != nil {
+		t.Fatalf("RefreshPrintHistoryFilamentUsage() error = %v", err)
+	}
+	if updatedEntry.FilamentUsed != 29.19 {
+		t.Fatalf("updated filament used = %.2f, want 29.19", updatedEntry.FilamentUsed)
+	}
+	if updatedEntry.SourcePath != "usb/test.bgcode" {
+		t.Fatalf("updated source path = %q, want %q", updatedEntry.SourcePath, "usb/test.bgcode")
+	}
+	if got := spoolman.usedWeight(20); got != 34.19 {
+		t.Fatalf("spool used weight = %.2f, want 34.19", got)
+	}
+}
+
+func TestRefreshPrintHistoryFilamentUsageFindsPathFromJobName(t *testing.T) {
+	spoolman := newHistoryTestSpoolmanServer()
+	defer spoolman.close()
+
+	prusaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/storage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"storage_list":[{"path":"/usb","available":true,"type":"USB"}]}`)
+		case "/api/v1/files/usb/cube.bgcode":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"meta":{"filament_used_g_per_tool":[18.75]}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer prusaServer.Close()
+
+	bridge := newTestBridge(t, spoolman.server.URL)
+
+	if err := bridge.SavePrinterConfig("printer-a", PrinterConfig{
+		Name:      "Printer A",
+		Model:     ModelCoreOne,
+		IPAddress: strings.TrimPrefix(prusaServer.URL, "http://"),
+		Toolheads: 1,
+	}); err != nil {
+		t.Fatalf("SavePrinterConfig() error = %v", err)
+	}
+
+	if err := bridge.LogPrintUsage("Printer A", 0, nil, 0, "cube.bgcode"); err != nil {
+		t.Fatalf("LogPrintUsage() error = %v", err)
+	}
+
+	history, err := bridge.GetPrintHistory(10)
+	if err != nil {
+		t.Fatalf("GetPrintHistory() error = %v", err)
+	}
+
+	updatedEntry, err := bridge.RefreshPrintHistoryFilamentUsage(history[0].ID, nil)
+	if err != nil {
+		t.Fatalf("RefreshPrintHistoryFilamentUsage() error = %v", err)
+	}
+	if updatedEntry.FilamentUsed != 18.75 {
+		t.Fatalf("updated filament used = %.2f, want 18.75", updatedEntry.FilamentUsed)
+	}
+	if updatedEntry.SourcePath != "usb/cube.bgcode" {
+		t.Fatalf("updated source path = %q, want %q", updatedEntry.SourcePath, "usb/cube.bgcode")
 	}
 }

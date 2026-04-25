@@ -510,6 +510,19 @@ function updateHistoryRowState(row) {
   action.classList.toggle("has-pending-change", hasChanged);
 }
 
+function setHistoryActionBusy(row, busy) {
+  if (!row) {
+    return;
+  }
+
+  const controls = row.querySelectorAll(
+    ".history-save-btn, .history-pull-btn, .history-weight-input",
+  );
+  controls.forEach((control) => {
+    control.disabled = busy;
+  });
+}
+
 function renderPrintHistory(history, spoolsById) {
   const tbody = document.getElementById("print-history-body");
   if (!tbody) {
@@ -580,7 +593,17 @@ function renderPrintHistory(history, spoolsById) {
       savePrintHistory(entry.id, selectedValue, weightInput, saveButton);
     });
 
+    const pullButton = document.createElement("button");
+    pullButton.className = "btn btn-small btn-secondary history-pull-btn";
+    pullButton.textContent = "Pull";
+    pullButton.addEventListener("click", function () {
+      const selectedValue =
+        dropdown.querySelector('input[type="hidden"]')?.value || "";
+      pullPrintHistory(entry.id, selectedValue, row, pullButton);
+    });
+
     action.appendChild(dropdown);
+    action.appendChild(pullButton);
     action.appendChild(saveButton);
     spoolCell.appendChild(action);
 
@@ -771,5 +794,43 @@ function savePrintHistory(historyId, spoolId, weightInput, button) {
     })
     .finally(() => {
       button.textContent = originalLabel;
+    });
+}
+
+function pullPrintHistory(historyId, spoolId, row, button) {
+  setHistoryActionBusy(row, true);
+  const originalLabel = button.textContent;
+  button.textContent = "Pulling...";
+  setHistoryFeedback("", "");
+
+  return historyFetchJson(`/api/print-history/${historyId}/pull`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      spool_id: spoolId === "" ? null : parseInt(spoolId, 10),
+    }),
+  })
+    .then((response) => {
+      const pulledValue = response?.entry?.filament_used;
+      if (Number.isFinite(pulledValue) && pulledValue > 0) {
+        setHistoryFeedback(
+          `Pulled ${normalizeHistoryWeightValue(pulledValue)}g from printer history.`,
+          "success",
+        );
+      } else {
+        setHistoryFeedback("Pulled print history from printer.", "success");
+      }
+      return loadPrintHistory();
+    })
+    .catch((error) => {
+      setHistoryFeedback(
+        `Failed to pull print history from printer: ${error.message}`,
+        "error",
+      );
+    })
+    .finally(() => {
+      button.textContent = originalLabel;
+      setHistoryActionBusy(row, false);
+      updateHistoryRowState(row);
     });
 }
