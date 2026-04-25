@@ -98,9 +98,9 @@ func (j prusaConnectJob) JobName() string {
 	case strings.TrimSpace(j.File.DisplayName) != "":
 		return strings.TrimSpace(j.File.DisplayName)
 	case strings.TrimSpace(j.File.Name) != "":
-		return strings.TrimSpace(j.File.Name)
+		return prusaPathBase(j.File.Name)
 	case strings.TrimSpace(j.Path) != "":
-		return strings.TrimSpace(j.Path)
+		return prusaPathBase(j.Path)
 	case j.ExternalJobID() != "":
 		return fmt.Sprintf("Prusa Connect Job %s", j.ExternalJobID())
 	default:

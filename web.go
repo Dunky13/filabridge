@@ -146,7 +146,8 @@ func (ws *WebServer) setupRoutes() {
 		api.GET("/spools", ws.spoolsHandler)
 		api.GET("/print-history", ws.getPrintHistoryHandler)
 		api.POST("/print-history/import", ws.importPrintHistoryHandler)
-		api.PUT("/print-history/:id/spool", ws.updatePrintHistorySpoolHandler)
+		api.PUT("/print-history/:id", ws.updatePrintHistoryHandler)
+		api.PUT("/print-history/:id/spool", ws.updatePrintHistoryHandler)
 		api.GET("/filaments", ws.filamentsHandler)
 		api.POST("/map_toolhead", ws.mapToolheadHandler)
 		api.GET("/available_spools", ws.availableSpoolsHandler)
@@ -499,7 +500,7 @@ func (ws *WebServer) getPrintHistoryHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"history": history})
 }
 
-func (ws *WebServer) updatePrintHistorySpoolHandler(c *gin.Context) {
+func (ws *WebServer) updatePrintHistoryHandler(c *gin.Context) {
 	historyID, err := strconv.Atoi(c.Param("id"))
 	if err != nil || historyID <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid print history id"})
@@ -507,7 +508,8 @@ func (ws *WebServer) updatePrintHistorySpoolHandler(c *gin.Context) {
 	}
 
 	var req struct {
-		SpoolID *int `json:"spool_id"`
+		SpoolID      *int     `json:"spool_id"`
+		FilamentUsed *float64 `json:"filament_used"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload"})
@@ -519,7 +521,22 @@ func (ws *WebServer) updatePrintHistorySpoolHandler(c *gin.Context) {
 		return
 	}
 
-	if err := ws.bridge.UpdatePrintHistorySpool(historyID, req.SpoolID); err != nil {
+	entry, err := ws.bridge.getPrintHistoryByID(historyID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	filamentUsed := entry.FilamentUsed
+	if req.FilamentUsed != nil {
+		if *req.FilamentUsed < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "filament_used must be greater than or equal to 0"})
+			return
+		}
+		filamentUsed = *req.FilamentUsed
+	}
+
+	if err := ws.bridge.UpdatePrintHistory(historyID, req.SpoolID, filamentUsed); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

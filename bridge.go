@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +21,8 @@ type FilamentBridge struct {
 	spoolman         *SpoolmanClient
 	db               *sql.DB
 	wasPrinting      map[string]bool
-	currentJobFile   map[string]string // Store current job filename per printer
+	currentJobFile   map[string]string // Store PrusaLink storage path per printer
+	currentJobName   map[string]string // Store human-readable job name per printer
 	currentJobUsage  map[string]map[int]float64
 	processingPrints map[string]bool       // Track prints being processed
 	printErrors      map[string]PrintError // Store print processing errors
@@ -84,6 +86,7 @@ func NewFilamentBridge(config *Config) (*FilamentBridge, error) {
 		spoolman:         NewSpoolmanClient(DefaultSpoolmanURL, SpoolmanTimeout, "", ""), // Default URL and timeout, will be updated
 		wasPrinting:      make(map[string]bool),
 		currentJobFile:   make(map[string]string),
+		currentJobName:   make(map[string]string),
 		currentJobUsage:  make(map[string]map[int]float64),
 		processingPrints: make(map[string]bool),
 		printErrors:      make(map[string]PrintError),
@@ -1188,10 +1191,13 @@ func (b *FilamentBridge) getPrintHistoryByID(historyID int) (*PrintHistory, erro
 	return &entry, nil
 }
 
-// UpdatePrintHistorySpool corrects which spool was used for an existing print.
-func (b *FilamentBridge) UpdatePrintHistorySpool(historyID int, spoolID *int) error {
+// UpdatePrintHistory corrects spool assignment and/or filament usage for an existing print.
+func (b *FilamentBridge) UpdatePrintHistory(historyID int, spoolID *int, filamentUsed float64) error {
 	if spoolID != nil && *spoolID <= 0 {
 		return fmt.Errorf("spool_id must be greater than 0")
+	}
+	if filamentUsed < 0 {
+		return fmt.Errorf("filament_used must be greater than or equal to 0")
 	}
 
 	entry, err := b.getPrintHistoryByID(historyID)
@@ -1209,7 +1215,7 @@ func (b *FilamentBridge) UpdatePrintHistorySpool(historyID int, spoolID *int) er
 		nextSpoolID = *spoolID
 	}
 
-	if currentSpoolID == nextSpoolID {
+	if currentSpoolID == nextSpoolID && math.Abs(entry.FilamentUsed-filamentUsed) < 0.0001 {
 		return nil
 	}
 
@@ -1219,15 +1225,15 @@ func (b *FilamentBridge) UpdatePrintHistorySpool(historyID int, spoolID *int) er
 		}
 	}
 
-	if entry.SpoolID != nil {
+	if entry.SpoolID != nil && entry.FilamentUsed > 0 {
 		if err := b.spoolman.AdjustSpoolUsage(*entry.SpoolID, -entry.FilamentUsed); err != nil {
 			return fmt.Errorf("failed to revert usage from spool %d: %w", *entry.SpoolID, err)
 		}
 	}
 
-	if spoolID != nil {
-		if err := b.spoolman.AdjustSpoolUsage(*spoolID, entry.FilamentUsed); err != nil {
-			if entry.SpoolID != nil {
+	if spoolID != nil && filamentUsed > 0 {
+		if err := b.spoolman.AdjustSpoolUsage(*spoolID, filamentUsed); err != nil {
+			if entry.SpoolID != nil && entry.FilamentUsed > 0 {
 				rollbackErr := b.spoolman.AdjustSpoolUsage(*entry.SpoolID, entry.FilamentUsed)
 				if rollbackErr != nil {
 					log.Printf("Failed to rollback print history correction for entry %d: %v", historyID, rollbackErr)
@@ -1240,15 +1246,15 @@ func (b *FilamentBridge) UpdatePrintHistorySpool(historyID int, spoolID *int) er
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
-	_, err = b.db.Exec("UPDATE print_history SET spool_id = ? WHERE id = ?", spoolID, historyID)
+	_, err = b.db.Exec("UPDATE print_history SET spool_id = ?, filament_used = ? WHERE id = ?", spoolID, filamentUsed, historyID)
 	if err != nil {
-		if spoolID != nil {
-			rollbackNewErr := b.spoolman.AdjustSpoolUsage(*spoolID, -entry.FilamentUsed)
+		if spoolID != nil && filamentUsed > 0 {
+			rollbackNewErr := b.spoolman.AdjustSpoolUsage(*spoolID, -filamentUsed)
 			if rollbackNewErr != nil {
 				log.Printf("Failed to rollback new spool usage for entry %d: %v", historyID, rollbackNewErr)
 			}
 		}
-		if entry.SpoolID != nil {
+		if entry.SpoolID != nil && entry.FilamentUsed > 0 {
 			rollbackOldErr := b.spoolman.AdjustSpoolUsage(*entry.SpoolID, entry.FilamentUsed)
 			if rollbackOldErr != nil {
 				log.Printf("Failed to restore original spool usage for entry %d: %v", historyID, rollbackOldErr)
@@ -1258,6 +1264,16 @@ func (b *FilamentBridge) UpdatePrintHistorySpool(historyID int, spoolID *int) er
 	}
 
 	return nil
+}
+
+// UpdatePrintHistorySpool corrects which spool was used for an existing print.
+func (b *FilamentBridge) UpdatePrintHistorySpool(historyID int, spoolID *int) error {
+	entry, err := b.getPrintHistoryByID(historyID)
+	if err != nil {
+		return err
+	}
+
+	return b.UpdatePrintHistory(historyID, spoolID, entry.FilamentUsed)
 }
 
 // MonitorPrinters monitors all printers for print status changes
@@ -1305,9 +1321,11 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 	currentState := status.Printer.State
 	jobName := "No active job"
 	currentJobFilename := ""
-	if jobInfo.File.Name != "" {
-		jobName = jobInfo.File.DisplayName // Use display name for better readability
+	currentJobDisplayName := ""
+	if jobInfo.File.Name != "" || jobInfo.File.DisplayName != "" || jobInfo.File.Path != "" {
 		currentJobFilename = joinPrusaStoragePath(jobInfo.File.Path, jobInfo.File.Name)
+		currentJobDisplayName = resolvePrusaJobName(jobInfo.File.DisplayName, jobInfo.File.Name, currentJobFilename)
+		jobName = currentJobDisplayName
 	}
 
 	currentJobUsage := cloneFilamentUsage(jobInfo.FilamentUsageByToolhead())
@@ -1316,6 +1334,7 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 	b.mutex.RLock()
 	wasPrinting := b.wasPrinting[printerID]
 	storedJobFile := b.currentJobFile[printerID]
+	storedJobName := b.currentJobName[printerID]
 	storedJobUsage := cloneFilamentUsage(b.currentJobUsage[printerID])
 	b.mutex.RUnlock()
 
@@ -1327,6 +1346,7 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 	if (currentState == StateIdle || currentState == StateFinished) && wasPrinting {
 		// Use stored filename (should be available since we stored it when printing started)
 		filenameToUse := storedJobFile
+		jobNameToUse := storedJobName
 		filamentUsageToUse := currentJobUsage
 		if len(filamentUsageToUse) == 0 {
 			filamentUsageToUse = storedJobUsage
@@ -1336,9 +1356,15 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 				config.IPAddress, printerID, currentJobFilename)
 			filenameToUse = currentJobFilename
 		}
+		if jobNameToUse == "" {
+			jobNameToUse = currentJobDisplayName
+		}
+		if jobNameToUse == "" {
+			jobNameToUse = resolvePrusaJobName("", "", filenameToUse)
+		}
 
 		log.Printf("🎉 Print finished detected for %s (%s): %s (state: %s, file: %s)",
-			config.IPAddress, printerID, jobName, currentState, filenameToUse)
+			config.IPAddress, printerID, jobNameToUse, currentState, filenameToUse)
 
 		// Mark as processing to prevent filename from being cleared
 		b.mutex.Lock()
@@ -1347,13 +1373,14 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 		b.mutex.Unlock()
 
 		// Now process the print (this takes a long time)
-		err := b.handlePrusaLinkPrintFinished(config, filenameToUse, filamentUsageToUse)
+		err := b.handlePrusaLinkPrintFinished(config, filenameToUse, jobNameToUse, filamentUsageToUse)
 
 		// Clear processing flag and filename after completion
 		b.mutex.Lock()
 		b.processingPrints[printerID] = false
 		if err == nil {
 			b.currentJobFile[printerID] = ""
+			delete(b.currentJobName, printerID)
 			delete(b.currentJobUsage, printerID)
 		}
 		b.mutex.Unlock()
@@ -1367,9 +1394,15 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 		defer b.mutex.Unlock()
 
 		// Store the current job filename when printing starts (only if not already stored)
-		if currentState == StatePrinting && currentJobFilename != "" && storedJobFile == "" {
-			b.currentJobFile[printerID] = currentJobFilename
-			log.Printf("📁 Stored job filename for %s (%s): %s", config.IPAddress, printerID, currentJobFilename)
+		if currentState == StatePrinting && currentJobFilename != "" {
+			if storedJobFile == "" {
+				b.currentJobFile[printerID] = currentJobFilename
+				log.Printf("📁 Stored job storage path for %s (%s): %s", config.IPAddress, printerID, currentJobFilename)
+			}
+			if storedJobName == "" && currentJobDisplayName != "" {
+				b.currentJobName[printerID] = currentJobDisplayName
+				log.Printf("📝 Stored job display name for %s (%s): %s", config.IPAddress, printerID, currentJobDisplayName)
+			}
 		}
 		if currentState == StatePrinting && len(currentJobUsage) > 0 {
 			b.currentJobUsage[printerID] = cloneFilamentUsage(currentJobUsage)
@@ -1381,6 +1414,7 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 		// Clear stored filename when print finishes (but only if not currently processing)
 		if (currentState == StateIdle || currentState == StateFinished) && !b.processingPrints[printerID] {
 			b.currentJobFile[printerID] = ""
+			delete(b.currentJobName, printerID)
 			delete(b.currentJobUsage, printerID)
 		}
 	}
@@ -1389,50 +1423,109 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 }
 
 // handlePrusaLinkPrintFinished handles when a print job finishes via PrusaLink
-func (b *FilamentBridge) handlePrusaLinkPrintFinished(config PrinterConfig, filename string, filamentUsage map[int]float64) error {
-	log.Printf("Print finished via PrusaLink (%s): %s", config.IPAddress, filename)
+func (b *FilamentBridge) handlePrusaLinkPrintFinished(config PrinterConfig, storagePath string, jobName string, filamentUsage map[int]float64) error {
+	if jobName == "" {
+		jobName = resolvePrusaJobName("", "", storagePath)
+	}
+
+	log.Printf("Print finished via PrusaLink (%s): %s (%s)", config.IPAddress, jobName, storagePath)
 
 	printerName := resolvePrinterName(config)
 
-	// Use the filename parameter (stored when print started)
-	if filename == "" {
+	// Use storage path captured while print was active.
+	if storagePath == "" {
 		errorMsg := "no filename available for print processing"
-		b.addPrintError(printerName, "unknown", errorMsg)
+		b.addPrintError(printerName, resolvePrusaJobName(jobName, "", ""), errorMsg)
 		return fmt.Errorf("%s", errorMsg)
 	}
 
 	if len(filamentUsage) > 0 {
 		log.Printf("Using filament usage from PrusaLink job metadata: %+v", filamentUsage)
 	} else {
-		log.Printf("Fetching print file metadata for filament usage: %s", filename)
+		log.Printf("Fetching print file metadata for filament usage: %s", storagePath)
 
 		prusaClient := NewPrusaLinkClient(config.IPAddress, config.APIKey, b.config.PrusaLinkTimeout, b.config.PrusaLinkFileDownloadTimeout)
-		fileInfo, err := prusaClient.GetPrintFileInfoWithRetry(filename)
+		resolvedUsage, err := prusaClient.GetFilamentUsageForFile(storagePath)
 		if err != nil {
-			errorMsg := fmt.Sprintf("failed to fetch print file metadata after retries: %v", err)
-			b.addPrintError(printerName, filename, errorMsg)
-			return fmt.Errorf("%s", errorMsg)
+			errorMsg := fmt.Sprintf("failed to extract filament usage from PrusaLink: %v", err)
+			return b.logPrintHistoryWithoutUsage(printerName, config, jobName, errorMsg)
 		}
 
-		filamentUsage = fileInfo.Meta.FilamentUsageByToolhead()
+		filamentUsage = resolvedUsage
 	}
 
 	// Check if we got any filament usage data
 	if len(filamentUsage) == 0 {
 		errorMsg := "no filament usage data found in PrusaLink metadata"
-		b.addPrintError(printerName, filename, errorMsg)
-		return fmt.Errorf("%s", errorMsg)
+		return b.logPrintHistoryWithoutUsage(printerName, config, jobName, errorMsg)
 	}
 
 	log.Printf("Successfully collected filament usage: %+v", filamentUsage)
 
 	// Process filament usage using helper function
-	if err := b.processFilamentUsage(printerName, filamentUsage, filename); err != nil {
+	if err := b.processFilamentUsage(printerName, filamentUsage, jobName); err != nil {
 		log.Printf("Error processing filament usage: %v", err)
 		return err
 	}
 
 	return nil
+}
+
+func (b *FilamentBridge) logPrintHistoryWithoutUsage(printerName string, config PrinterConfig, jobName string, errorMsg string) error {
+	b.addPrintError(printerName, jobName, errorMsg)
+
+	toolheadID, spoolID := b.getBestEffortHistoryTarget(printerName, config)
+	if err := b.LogPrintUsage(printerName, toolheadID, spoolID, 0, jobName); err != nil {
+		return fmt.Errorf("failed to log print without filament usage: %w", err)
+	}
+
+	if spoolID != nil {
+		log.Printf("Logged completed print for %s on toolhead %d with spool %d but unknown filament weight",
+			printerName, toolheadID, *spoolID)
+	} else {
+		log.Printf("Logged completed print for %s on toolhead %d with unknown spool and filament weight",
+			printerName, toolheadID)
+	}
+
+	return nil
+}
+
+func (b *FilamentBridge) getBestEffortHistoryTarget(printerName string, config PrinterConfig) (int, *int) {
+	toolheadCount := config.Toolheads
+	if toolheadCount < 1 {
+		toolheadCount = 1
+	}
+
+	if toolheadCount == 1 {
+		spoolID, err := b.GetToolheadMapping(printerName, 0)
+		if err == nil && spoolID > 0 {
+			return 0, cloneIntPointer(&spoolID)
+		}
+
+		return 0, nil
+	}
+
+	mappedToolheadID := -1
+	mappedSpoolID := 0
+	for toolheadID := 0; toolheadID < toolheadCount; toolheadID++ {
+		spoolID, err := b.GetToolheadMapping(printerName, toolheadID)
+		if err != nil || spoolID <= 0 {
+			continue
+		}
+
+		if mappedToolheadID != -1 {
+			return 0, nil
+		}
+
+		mappedToolheadID = toolheadID
+		mappedSpoolID = spoolID
+	}
+
+	if mappedToolheadID == -1 {
+		return 0, nil
+	}
+
+	return mappedToolheadID, cloneIntPointer(&mappedSpoolID)
 }
 
 func cloneFilamentUsage(usage map[int]float64) map[int]float64 {
@@ -1460,6 +1553,26 @@ func joinPrusaStoragePath(storagePath string, name string) string {
 	default:
 		return storagePath + "/" + name
 	}
+}
+
+func prusaPathBase(value string) string {
+	value = strings.Trim(strings.TrimSpace(value), "/")
+	if value == "" {
+		return ""
+	}
+
+	parts := strings.Split(value, "/")
+	return parts[len(parts)-1]
+}
+
+func resolvePrusaJobName(displayName string, name string, storagePath string) string {
+	if displayName = strings.TrimSpace(displayName); displayName != "" {
+		return displayName
+	}
+	if name = prusaPathBase(name); name != "" {
+		return name
+	}
+	return prusaPathBase(storagePath)
 }
 
 // GetPrintErrors returns all unacknowledged print errors

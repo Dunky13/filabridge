@@ -16,9 +16,10 @@ import (
 
 // PrusaLinkClient handles communication with PrusaLink API
 type PrusaLinkClient struct {
-	baseURL    string
-	apiKey     string
-	httpClient *http.Client
+	baseURL             string
+	apiKey              string
+	httpClient          *http.Client
+	fileDownloadTimeout int
 }
 
 // PrusaLinkStatus represents the status response from PrusaLink
@@ -54,8 +55,10 @@ type PrusaLinkJob struct {
 }
 
 type PrusaLinkPrintFileMetadata struct {
-	FilamentUsedG        float64   `json:"filament used [g]"`
-	FilamentUsedGPerTool []float64 `json:"filament used [g] per tool"`
+	FilamentUsedG              float64   `json:"filament_used_g"`
+	LegacyFilamentUsedG        float64   `json:"filament used [g]"`
+	FilamentUsedGPerTool       []float64 `json:"filament_used_g_per_tool"`
+	LegacyFilamentUsedGPerTool []float64 `json:"filament used [g] per tool"`
 }
 
 type PrusaLinkPrintFileInfo struct {
@@ -64,9 +67,14 @@ type PrusaLinkPrintFileInfo struct {
 
 // FilamentUsageByToolhead converts print file metadata into toolhead-weight mapping.
 func (m PrusaLinkPrintFileMetadata) FilamentUsageByToolhead() map[int]float64 {
-	if len(m.FilamentUsedGPerTool) > 0 {
-		usage := make(map[int]float64, len(m.FilamentUsedGPerTool))
-		for toolheadID, weight := range m.FilamentUsedGPerTool {
+	perTool := m.FilamentUsedGPerTool
+	if len(perTool) == 0 {
+		perTool = m.LegacyFilamentUsedGPerTool
+	}
+
+	if len(perTool) > 0 {
+		usage := make(map[int]float64, len(perTool))
+		for toolheadID, weight := range perTool {
 			if weight <= 0 {
 				continue
 			}
@@ -77,8 +85,13 @@ func (m PrusaLinkPrintFileMetadata) FilamentUsageByToolhead() map[int]float64 {
 		}
 	}
 
-	if m.FilamentUsedG > 0 {
-		return map[int]float64{0: m.FilamentUsedG}
+	totalWeight := m.FilamentUsedG
+	if totalWeight <= 0 {
+		totalWeight = m.LegacyFilamentUsedG
+	}
+
+	if totalWeight > 0 {
+		return map[int]float64{0: totalWeight}
 	}
 
 	return nil
@@ -121,8 +134,9 @@ func NewPrusaLinkClient(ipAddress, apiKey string, timeout, fileDownloadTimeout i
 	}
 
 	return &PrusaLinkClient{
-		baseURL: fmt.Sprintf("http://%s", ipAddress),
-		apiKey:  apiKey,
+		baseURL:             fmt.Sprintf("http://%s", ipAddress),
+		apiKey:              apiKey,
+		fileDownloadTimeout: fileDownloadTimeout,
 		httpClient: &http.Client{
 			Timeout:   time.Duration(timeout) * time.Second,
 			Transport: transport,
@@ -254,6 +268,44 @@ func (c *PrusaLinkClient) GetPrintFileInfoWithRetry(storagePath string) (*PrusaL
 	}
 
 	return nil, fmt.Errorf("failed to fetch print file metadata after %d attempts: %w", maxRetries, lastErr)
+}
+
+// GetFilamentUsageForFile retrieves filament usage from PrusaLink metadata, then falls back
+// to downloading and parsing the print file when metadata is missing or unavailable.
+func (c *PrusaLinkClient) GetFilamentUsageForFile(storagePath string) (map[int]float64, error) {
+	info, metadataErr := c.GetPrintFileInfoWithRetry(storagePath)
+	if metadataErr == nil {
+		if usage := info.Meta.FilamentUsageByToolhead(); len(usage) > 0 {
+			return usage, nil
+		}
+		log.Printf("No filament usage in PrusaLink metadata for %s, falling back to file parse", storagePath)
+	} else {
+		log.Printf("Metadata fetch failed for %s, falling back to file parse: %v", storagePath, metadataErr)
+	}
+
+	gcodeContent, downloadErr := c.GetGcodeFileWithRetry(storagePath, c.fileDownloadTimeout)
+	if downloadErr != nil {
+		if metadataErr != nil {
+			return nil, fmt.Errorf("metadata fetch failed: %w; file download fallback failed: %v", metadataErr, downloadErr)
+		}
+		return nil, fmt.Errorf("failed to download print file for filament usage fallback: %w", downloadErr)
+	}
+
+	filamentUsage, parseErr := c.ParseGcodeFilamentUsage(gcodeContent)
+	if parseErr != nil {
+		if metadataErr != nil {
+			return nil, fmt.Errorf("metadata fetch failed: %w; file parse fallback failed: %v", metadataErr, parseErr)
+		}
+		return nil, fmt.Errorf("failed to parse print file for filament usage fallback: %w", parseErr)
+	}
+	if len(filamentUsage) == 0 {
+		if metadataErr != nil {
+			return nil, fmt.Errorf("metadata fetch failed: %w; file parse fallback found no filament usage", metadataErr)
+		}
+		return nil, fmt.Errorf("no filament usage data found in PrusaLink metadata or print file")
+	}
+
+	return filamentUsage, nil
 }
 
 // GetPrinterInfo retrieves the printer information

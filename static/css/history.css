@@ -129,7 +129,7 @@
 }
 
 .history-col-used {
-  width: 110px;
+  width: 180px;
   white-space: nowrap;
 }
 
@@ -248,6 +248,26 @@
 .history-save-btn {
   margin: 0;
   flex: 0 0 auto;
+}
+
+.history-used-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.history-weight-input {
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: #fff;
+}
+
+.history-weight-input.invalid {
+  border-color: rgba(220, 53, 69, 0.7);
 }
 
 .history-empty {

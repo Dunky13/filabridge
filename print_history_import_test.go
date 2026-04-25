@@ -5,6 +5,16 @@ import (
 	"time"
 )
 
+func TestPrusaConnectJobNameUsesBasenameFallback(t *testing.T) {
+	job := prusaConnectJob{
+		Path: "usb/MERGED~1.BGC",
+	}
+
+	if got := job.JobName(); got != "MERGED~1.BGC" {
+		t.Fatalf("JobName() = %q, want %q", got, "MERGED~1.BGC")
+	}
+}
+
 func TestImportPrusaConnectPrintHistoryImportsRows(t *testing.T) {
 	spoolman := newHistoryTestSpoolmanServer()
 	defer spoolman.close()
