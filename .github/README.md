@@ -48,6 +48,10 @@ Spoolman tag lookup and association are exposed only when its OpenAPI schema adv
 
 Compatibility baseline and source evidence: [PrusaSlicer 3.0 compatibility research](../docs/research/prusaslicer-3.0-filabridge-compatibility.md).
 
+Spoolman filament definitions can also be synchronized into PrusaSlicer 3 as
+FilaBridge-managed user profiles. This sync deliberately excludes physical
+spools and remaining inventory. See [PrusaSlicer profile sync](../docs/prusaslicer-profile-sync.md).
+
 ## Why FilaBridge?
 
 Managing filament inventory across multiple 3D printers is tedious. FilaBridge automates this by:
@@ -247,6 +251,7 @@ All `/api/*` endpoints use the configured management Basic credentials. Only
 - `GET /healthz` - Public process-readiness check (no printer or inventory data)
 - `GET /api/status` - Get current printer status and mappings
 - `GET /api/spools` - Get all spools from Spoolman
+- `GET /api/prusaslicer/profiles.zip` - Download deterministic PrusaSlicer 3 managed filament profiles
 - `POST /api/map_toolhead` - Map a spool to a toolhead
 - `POST /api/unmap_toolhead` - Unmap a spool from a toolhead
 - `GET /api/print-errors` - Get all unacknowledged print errors

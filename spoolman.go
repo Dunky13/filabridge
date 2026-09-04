@@ -139,6 +139,7 @@ type SpoolmanFilament struct {
 	Diameter             float64                `json:"diameter"`
 	Weight               float64                `json:"weight"`
 	SpoolWeight          float64                `json:"spool_weight"`
+	Price                float64                `json:"price"`
 	SettingsExtruderTemp int                    `json:"settings_extruder_temp"`
 	SettingsBedTemp      int                    `json:"settings_bed_temp"`
 	ColorHex             string                 `json:"color_hex"`

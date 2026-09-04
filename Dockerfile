@@ -22,6 +22,7 @@ COPY static/ ./static/
 
 # Copy source code
 COPY *.go ./
+COPY profilesync/ ./profilesync/
 
 # Build the application with cache mounts
 RUN --mount=type=cache,target=/go/pkg/mod \

@@ -193,6 +193,7 @@ func (ws *WebServer) setupRoutes() {
 		management.PUT("/config/auto-assign-previous-spool", ws.updateAutoAssignPreviousSpoolHandler)
 		management.GET("/printers", ws.getPrintersHandler)
 		management.GET("/printer-presets", ws.printerPresetsHandler)
+		management.GET("/prusaslicer/profiles.zip", requiredProfileExportAuthMiddleware(), ws.prusaSlicerProfilesHandler)
 		management.POST("/printers", ws.addPrinterHandler)
 		management.PUT("/printers/:id", ws.updatePrinterHandler)
 		management.DELETE("/printers/:id", ws.deletePrinterHandler)

@@ -39,7 +39,7 @@ The release is explicitly unstable and incomplete relative to 2.9.6. Compatibili
 
 ## The output contract FilaBridge actually depends on
 
-FilaBridge does not integrate with PrusaSlicer directly. In the current repository it reads PrusaLink `/api/v1/status`, `/api/v1/job`, `/api/v1/info`, `/api/v1/storage`, and `/api/v1/files/...`; it obtains print-file metadata or downloads file content; then it parses total/per-tool grams and updates Spoolman.
+FilaBridge's consumption path does not depend on a live PrusaSlicer connection. It reads PrusaLink `/api/v1/status`, `/api/v1/job`, `/api/v1/info`, `/api/v1/storage`, and `/api/v1/files/...`; it obtains print-file metadata or downloads file content; then it parses total/per-tool grams and updates Spoolman. A separate one-way catalog sync can export Spoolman filament definitions as managed PrusaSlicer 3 user profiles; physical spool identity and inventory remain in FilaBridge and Spoolman.
 
 ### ASCII G-code remains compatible
 

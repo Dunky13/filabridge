@@ -9,6 +9,12 @@
 | Firmware Buddy | 6.10.1 | PrusaLink state/auth/metadata variants through mocked API tests |
 | Spoolman | 0.26.1 | Usage accounting; tag APIs must be capability-detected and fail closed |
 
+PrusaSlicer profile sync accepts major version 3 only. Generated profiles
+inherit verified Generic profiles from the Prusa Research user namespace; this
+avoids replacing or deselecting Prusa's official preset source. A newer major
+version remains blocked until its user-profile layout and inheritance behavior
+are verified.
+
 Earlier PrusaSlicer 3.0 alphas are not claimed as supported baselines. Alpha11
 is the first pinned 3.0 baseline for this branch. The weekly upstream workflow
 fails when a newer 3.0/Firmware Buddy/Spoolman release appears; support is only

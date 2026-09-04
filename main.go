@@ -17,6 +17,10 @@ func main() {
 }
 
 func run(parent context.Context, args []string) error {
+	if len(args) > 0 && args[0] == "profile-sync" {
+		return runProfileSync(parent, args[1:], os.Stdout, nil, nil)
+	}
+
 	// Command line flags
 	var (
 		flags      = flag.NewFlagSet("filabridge", flag.ContinueOnError)
