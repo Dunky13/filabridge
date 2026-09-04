@@ -1,8 +1,13 @@
 # FilaBridge
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Go Version](https://img.shields.io/badge/Go-1.23-00ADD8?logo=go)](https://golang.org/)
+[![Go Version](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)](https://go.dev/)
 [![GitHub release](https://img.shields.io/github/v/release/needo37/filabridge)](https://github.com/needo37/filabridge/releases)
+
+Manual release and container workflow runs publish the requested immutable
+version tag. The rolling `latest` tag is updated only when that version is the
+repository's highest stable SemVer; prereleases and older/backfilled tags cannot
+roll the default image backward.
 
 A high-performance Go microservice that bridges PrusaLink-compatible printers and Spoolman for (mostly) automatic filament inventory management. Originally designed for Prusa printers (CORE One, XL, MK4, etc.) but works with any printer that supports the PrusaLink API.
 
@@ -76,7 +81,7 @@ _Location management interface for creating printer toolhead and storage locatio
 - A PrusaLink-compatible 3D printer (Prusa or any printer with PrusaLink API)
 - PrusaLink enabled on your printer(s) for local network access
 - Spoolman
-- **For building from source**: Go 1.23 or higher
+- **For building from source**: Go 1.25 or higher
 - **(Optional) For NFC features**: NFC-capable smartphone and NFC tags (NTAG213/215/216 recommended)
 - **(Recommendation) NFC Tools Pro** mobile app (for programming tags)
 
@@ -94,7 +99,9 @@ _Location management interface for creating printer toolhead and storage locatio
 
    ```bash
    docker run -d --name filabridge -p 5000:5000 \
-     -v .:/app/data \
+     -e FILABRIDGE_WEB_USERNAME=admin \
+     -e FILABRIDGE_WEB_PASSWORD='replace-with-a-long-random-password' \
+     -v filabridge-data:/app/data \
      ghcr.io/needo37/filabridge:latest
    ```
 
@@ -105,10 +112,23 @@ _Location management interface for creating printer toolhead and storage locatio
 ```bash
 git clone https://github.com/needo37/filabridge.git
 cd filabridge
-docker-compose up -d
+export FILABRIDGE_WEB_USERNAME=admin
+export FILABRIDGE_WEB_PASSWORD='replace-with-a-long-random-password'
+docker compose up -d
 ```
 
-The docker-compose.yml automatically sets the `FILABRIDGE_DB_PATH` environment variable to `/app/data` to ensure the database persists in the mounted volume.
+The Compose file persists SQLite in the `filabridge-data` named volume. Access
+from another device requires both web credential variables. Put FilaBridge
+behind a TLS reverse proxy before sending Basic credentials across a network;
+plain HTTP exposes those credentials to anyone able to observe that traffic.
+For direct HTTP access, leave `FILABRIDGE_PUBLIC_ORIGIN` unset so the browser's
+actual hostname or LAN address is accepted. When using a reverse proxy, set it
+to the exact external origin, for example `https://filabridge.example.com`. FilaBridge uses it for
+mutation/WebSocket origin checks and generated NFC URLs; do not include a path.
+
+Existing installs using `./data:/app/data` can keep that bind mount, but the
+directory must be writable by container UID/GID `10001` before switching to the
+non-root image.
 
 ### Option 2: Pre-built Binary
 
@@ -182,7 +202,9 @@ The system stores all configuration in the SQLite database. For Docker deploymen
 # Run both bridge service and web interface (recommended)
 ./filabridge
 
-# Custom host and port
+# Custom host and port. Non-loopback access requires both credential variables.
+FILABRIDGE_WEB_USERNAME=admin \
+FILABRIDGE_WEB_PASSWORD='replace-with-a-long-random-password' \
 ./filabridge --host 0.0.0.0 --port 8080
 ```
 
@@ -219,13 +241,18 @@ The web interface provides:
 
 The web interface also provides REST API endpoints:
 
+All `/api/*` endpoints use the configured management Basic credentials. Only
+`/healthz` remains unauthenticated for readiness probes.
+
+- `GET /healthz` - Public process-readiness check (no printer or inventory data)
 - `GET /api/status` - Get current printer status and mappings
 - `GET /api/spools` - Get all spools from Spoolman
 - `POST /api/map_toolhead` - Map a spool to a toolhead
 - `POST /api/unmap_toolhead` - Unmap a spool from a toolhead
 - `GET /api/print-errors` - Get all unacknowledged print errors
 - `POST /api/print-errors/{id}/acknowledge` - Acknowledge a print error
-- `GET /api/nfc/assign` - Handle NFC tag scans (spool or location)
+- `GET /api/nfc/assign` - Preview a scanned NFC tag and show confirmation
+- `POST /api/nfc/assign` - Confirm the scan and update the NFC assignment session
 - `GET /api/nfc/urls` - Get all NFC URLs with QR codes
 - `GET /api/nfc/session/status` - Check NFC session status
 - `GET /api/locations` - Get all locations
@@ -309,6 +336,11 @@ go build -o filabridge .
 
 # Run tests
 go test ./...
+
+# Run the real-browser dashboard smoke test
+npm ci --ignore-scripts --no-audit --no-fund
+npx --no-install playwright install chromium
+npm run test:browser
 
 # Run with race detection
 go run -race .

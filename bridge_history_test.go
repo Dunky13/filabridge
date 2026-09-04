@@ -44,6 +44,18 @@ func newHistoryTestSpoolmanServer() *historyTestSpoolmanServer {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/location":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(ts.locations)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/spool":
+			ts.mu.Lock()
+			spools := make([]SpoolmanSpool, 0, len(ts.spools))
+			for _, spool := range ts.spools {
+				spools = append(spools, spool)
+			}
+			ts.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(spools)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/filament":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("[]"))
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/spool/"):
 			spoolID, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/api/v1/spool/"))
 			if err != nil {
@@ -245,7 +257,7 @@ func TestUpdatePrintHistoryAdjustsSpoolUsageWhenWeightChanges(t *testing.T) {
 
 	bridge := newTestBridge(t, spoolman.server.URL)
 
-	if err := bridge.spoolman.AdjustSpoolUsage(20, 12.5); err != nil {
+	if err := bridge.spoolmanSnapshot().AdjustSpoolUsage(20, 12.5); err != nil {
 		t.Fatalf("AdjustSpoolUsage() error = %v", err)
 	}
 
@@ -724,6 +736,9 @@ func TestMonitorPrusaLinkRestoresActiveJobAfterRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFilamentBridge(first) error = %v", err)
 	}
+	if err := first.SavePrinterConfig("printer-a", printer); err != nil {
+		t.Fatalf("SavePrinterConfig() error = %v", err)
+	}
 	if err := first.SetToolheadMapping("Printer A", 0, 20); err != nil {
 		t.Fatalf("SetToolheadMapping() error = %v", err)
 	}
@@ -874,6 +889,9 @@ func TestRestartReclaimsInterruptedProcessingCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFilamentBridge(first) error = %v", err)
 	}
+	if err := first.SavePrinterConfig("printer-a", printer); err != nil {
+		t.Fatalf("SavePrinterConfig() error = %v", err)
+	}
 	if err := first.SetToolheadMapping("Printer A", 0, 20); err != nil {
 		t.Fatalf("SetToolheadMapping() error = %v", err)
 	}
@@ -949,6 +967,64 @@ func TestAmbiguousReadyJobRequiresExplicitResolution(t *testing.T) {
 	}
 }
 
+func TestStatusOnlyTransientStateDoesNotBlockNextRealJob(t *testing.T) {
+	for _, transientState := range []string{StateBusy, StateAttention} {
+		t.Run(transientState, func(t *testing.T) {
+			spoolman := newHistoryTestSpoolmanServer()
+			defer spoolman.close()
+			bridge := newTestBridge(t, spoolman.server.URL)
+			printer := PrinterConfig{Name: "Printer A", Model: "MK4S", IPAddress: "printer.local", Toolheads: 1}
+			if err := bridge.SavePrinterConfig("printer-a", printer); err != nil {
+				t.Fatalf("SavePrinterConfig() error = %v", err)
+			}
+			if err := bridge.SetToolheadMapping("printer-a", 0, 20); err != nil {
+				t.Fatalf("SetToolheadMapping() error = %v", err)
+			}
+
+			transient := &PrusaLinkStatus{}
+			transient.Printer.State = transientState
+			if err := bridge.reconcilePrusaLinkJob("printer-a", printer, transient, &PrusaLinkJob{}, "", "", nil); err != nil {
+				t.Fatalf("reconcile status-only %s error = %v", transientState, err)
+			}
+			checkpoint, err := bridge.loadPrinterJobCheckpoint("printer-a")
+			if err != nil {
+				t.Fatalf("load checkpoint after status-only %s: %v", transientState, err)
+			}
+			if checkpoint != nil {
+				t.Fatalf("status-only %s created checkpoint = %#v", transientState, checkpoint)
+			}
+
+			active := &PrusaLinkStatus{}
+			active.Printer.State = StatePrinting
+			active.Job.ID = 42
+			active.Job.Progress = 25
+			job := &PrusaLinkJob{ID: 42, State: StatePrinting}
+			job.File.Path = "usb"
+			job.File.Name = "real-job.bgcode"
+			usage := map[int]float64{0: 12.5}
+			if err := bridge.reconcilePrusaLinkJob("printer-a", printer, active, job, "usb/real-job.bgcode", "real-job.bgcode", usage); err != nil {
+				t.Fatalf("reconcile real active job after %s error = %v", transientState, err)
+			}
+
+			finished := &PrusaLinkStatus{}
+			finished.Printer.State = StateFinished
+			finished.Job.ID = 42
+			finished.Job.Progress = 100
+			job.State = StateFinished
+			if err := bridge.reconcilePrusaLinkJob("printer-a", printer, finished, job, "usb/real-job.bgcode", "real-job.bgcode", usage); err != nil {
+				t.Fatalf("finish real job after %s error = %v", transientState, err)
+			}
+			if got := spoolman.usedWeight(20); got != 17.5 {
+				t.Fatalf("spool used weight after %s = %.2f, want 17.50", transientState, got)
+			}
+			history, err := bridge.GetPrintHistory(10)
+			if err != nil || len(history) != 1 || history[0].JobName != "real-job.bgcode" {
+				t.Fatalf("history after %s = %#v, err=%v; want one real job", transientState, history, err)
+			}
+		})
+	}
+}
+
 func TestTerminalEventForDifferentJobDoesNotFinalizeCheckpoint(t *testing.T) {
 	spoolman := newHistoryTestSpoolmanServer()
 	defer spoolman.close()
@@ -997,6 +1073,9 @@ func TestLiveAccountingLeaseRejectsStaleWriterAndFencesExpiredOwner(t *testing.T
 	}
 	defer second.Close()
 	printer := PrinterConfig{Name: "Printer A", IPAddress: "printer.local", Toolheads: 1}
+	if err := first.SavePrinterConfig("printer-a", printer); err != nil {
+		t.Fatalf("SavePrinterConfig() error = %v", err)
+	}
 	if err := first.saveActiveJobCheckpoint("printer-a", printer, 42, "usb/lease.bgcode", "lease.bgcode", map[int]float64{0: 5}, StatePrinting, 50); err != nil {
 		t.Fatalf("saveActiveJobCheckpoint() error = %v", err)
 	}
@@ -1067,7 +1146,7 @@ func TestRefreshPrintHistoryFilamentUsageUsesStoredSourcePath(t *testing.T) {
 		t.Fatalf("SavePrinterConfig() error = %v", err)
 	}
 
-	if err := bridge.spoolman.AdjustSpoolUsage(20, 12.5); err != nil {
+	if err := bridge.spoolmanSnapshot().AdjustSpoolUsage(20, 12.5); err != nil {
 		t.Fatalf("AdjustSpoolUsage() error = %v", err)
 	}
 	if err := bridge.LogPrintUsageWithSourcePath("Printer A", 0, historyIntPointer(20), 12.5, "test.gcode", "usb/test.gcode"); err != nil {

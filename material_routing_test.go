@@ -10,7 +10,7 @@ func TestProcessFilamentUsageUsesConfiguredLogicalToolRoute(t *testing.T) {
 	if err := bridge.SetToolheadMapping("Printer A", 7, 20); err != nil {
 		t.Fatalf("SetToolheadMapping() error = %v", err)
 	}
-	if err := bridge.SetLogicalToolRoute("Printer A", 0, 7); err != nil {
+	if err := bridge.SetLogicalToolRoute("printer-a", 0, 7); err != nil {
 		t.Fatalf("SetLogicalToolRoute() error = %v", err)
 	}
 
@@ -75,7 +75,11 @@ func TestObservedOnlyAuthorityRecordsUsageWithoutDebitingSpoolman(t *testing.T) 
 	spoolman := newHistoryTestSpoolmanServer()
 	defer spoolman.close()
 	bridge := newTestBridge(t, spoolman.server.URL)
-	bridge.config.ConsumptionAuthority = ConsumptionAuthorityObservedOnly
+	config := bridge.GetConfigSnapshot()
+	config.ConsumptionAuthority = ConsumptionAuthorityObservedOnly
+	if err := bridge.UpdateConfig(config); err != nil {
+		t.Fatalf("UpdateConfig() error = %v", err)
+	}
 	if err := bridge.SetToolheadMapping("Printer A", 0, 20); err != nil {
 		t.Fatalf("SetToolheadMapping() error = %v", err)
 	}

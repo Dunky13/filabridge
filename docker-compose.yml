@@ -1,10 +1,21 @@
-version: '3.8'
-
 services:
   filabridge:
     image: ghcr.io/needo37/filabridge:latest
     ports:
       - "5000:5000"
     volumes:
-      - ./data:/app/data
+      - filabridge-data:/app/data
+    environment:
+      FILABRIDGE_WEB_USERNAME: ${FILABRIDGE_WEB_USERNAME:?set FILABRIDGE_WEB_USERNAME}
+      FILABRIDGE_WEB_PASSWORD: ${FILABRIDGE_WEB_PASSWORD:?set FILABRIDGE_WEB_PASSWORD}
+      FILABRIDGE_PUBLIC_ORIGIN: ${FILABRIDGE_PUBLIC_ORIGIN:-}
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:5000/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  filabridge-data:

@@ -84,6 +84,11 @@ func newTestBridge(t *testing.T, spoolmanURL string) *FilamentBridge {
 	if err != nil {
 		t.Fatalf("NewFilamentBridge() error = %v", err)
 	}
+	if err := bridge.SavePrinterConfig("printer-a", PrinterConfig{
+		Name: "Printer A", Model: "MK4S", IPAddress: "printer.local", Toolheads: 8,
+	}); err != nil {
+		t.Fatalf("SavePrinterConfig(default test printer) error = %v", err)
+	}
 
 	t.Cleanup(func() {
 		_ = bridge.db.Close()

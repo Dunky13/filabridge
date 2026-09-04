@@ -14,3 +14,34 @@ container contract without pretending to be archived slicer output.
 When the scheduled upstream-release check reports a new PrusaSlicer 3 or
 Firmware Buddy release, add its single-tool and multi-tool outputs here before
 updating `upstream-releases.json`.
+
+## Real upstream evidence gate
+
+Synthetic fixtures protect parser edge cases but cannot prove compatibility
+with a released slicer or firmware. Record only real, reproducible evidence in
+`golden-fixtures.json`; its structure is documented by
+`golden-fixture.schema.json`.
+
+For each pinned release:
+
+1. Generate G-code and, where the release supports it, BGCode with the official
+   PrusaSlicer build. If a pinned release cannot emit BGCode, encode its exact
+   ASCII output with that release's pinned libbgcode revision. Record the actual
+   producer, producer commit, input artifact, checksum, and expected logical-tool
+   grams; never label a libbgcode conversion as a PrusaSlicer export.
+2. Capture and sanitize the real printer responses used by FilaBridge. Remove
+   credentials, serial numbers, hostnames, addresses, job names, and file paths.
+3. Run real ASCII and BGCode prints, verify accounting and restart recovery,
+   sanitize the resulting evidence report, and add its checksum to the hardware
+   attestation.
+4. Run `scripts/verify-golden-fixtures.sh --release`.
+
+The artifact array contains reproducible alpha11 ASCII outputs plus a BGCode
+conversion made by alpha11's exact pinned libbgcode revision; each row declares
+its producer. See `golden/README.md`. Firmware and hardware arrays remain empty
+until those checks are performed on each exact family/model in
+`release_evidence_requirements`. The structure check passes in normal CI;
+tagged releases fail closed at the first missing non-preview family-specific
+capture or physical attestation. Preview rows are validated when present but
+remain nonblocking until promoted. Evidence for another model cannot satisfy that row.
+Never copy a synthetic fixture into this manifest to bypass the gate.

@@ -21,29 +21,6 @@ const (
 	jobAccountingLease      = 15 * time.Minute
 )
 
-func (b *FilamentBridge) ensureJobCheckpointSchema() error {
-	columns, err := b.getTableColumns("printer_job_checkpoints")
-	if err != nil {
-		return err
-	}
-	statements := []struct {
-		column string
-		query  string
-	}{
-		{column: "accounting_owner", query: "ALTER TABLE printer_job_checkpoints ADD COLUMN accounting_owner TEXT"},
-		{column: "accounting_lease_until", query: "ALTER TABLE printer_job_checkpoints ADD COLUMN accounting_lease_until INTEGER"},
-	}
-	for _, statement := range statements {
-		if columns[statement.column] {
-			continue
-		}
-		if _, err := b.db.Exec(statement.query); err != nil {
-			return fmt.Errorf("failed to add printer_job_checkpoints.%s: %w", statement.column, err)
-		}
-	}
-	return nil
-}
-
 type printerJobCheckpoint struct {
 	PrinterID        string
 	PrinterName      string
@@ -101,6 +78,16 @@ func (b *FilamentBridge) reconcilePrusaLinkJob(printerID string, config PrinterC
 		jobID := status.Job.ID
 		if jobID == 0 && jobInfo != nil {
 			jobID = jobInfo.ID
+		}
+		if jobID == 0 && strings.TrimSpace(sourcePath) == "" && strings.TrimSpace(jobName) == "" {
+			checkpoint, err := b.loadPrinterJobCheckpoint(printerID)
+			if err != nil || checkpoint == nil {
+				return err
+			}
+			// BUSY and ATTENTION may describe a printer-level transient with no
+			// print behind it. Preserve a known job, but never fabricate one that
+			// can block the next identified print.
+			return b.updateCheckpointObservation(printerID, state, status.Job.Progress, usage)
 		}
 		return b.saveActiveJobCheckpoint(printerID, config, jobID, sourcePath, jobName, usage, state, status.Job.Progress)
 	}
@@ -216,7 +203,6 @@ func (b *FilamentBridge) saveActiveJobCheckpoint(printerID string, config Printe
 	if err := b.upsertPrinterJobCheckpoint(checkpoint); err != nil {
 		return err
 	}
-	b.syncLegacyJobTracking(checkpoint)
 	return nil
 }
 
@@ -437,10 +423,10 @@ func (b *FilamentBridge) abortCheckpoint(checkpoint *printerJobCheckpoint, confi
 	accountingKey := fmt.Sprintf("%s:%d:abort", checkpoint.PrinterID, checkpoint.StartedAt.UnixNano())
 	_, err = b.db.Exec(`
 		INSERT OR IGNORE INTO print_history (
-			printer_name, toolhead_id, spool_id, filament_used, print_started,
+			printer_id, printer_name_at_event, toolhead_id, spool_id, filament_used, print_started,
 			print_finished, job_name, source_path, print_state, accounting_key
-		) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
-	`, checkpoint.PrinterName, toolheadID, spoolID, checkpoint.StartedAt,
+		) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+	`, checkpoint.PrinterID, checkpoint.PrinterName, toolheadID, spoolID, checkpoint.StartedAt,
 		time.Now().UTC(), checkpoint.JobName, checkpoint.SourcePath, terminalState, accountingKey)
 	if err != nil {
 		_ = b.setCheckpointResult(checkpoint, jobAccountingFailed, terminalState)
@@ -468,22 +454,7 @@ func (b *FilamentBridge) setCheckpointResult(checkpoint *printerJobCheckpoint, a
 		return fmt.Errorf("printer job checkpoint changed before finalization")
 	}
 
-	b.mutex.Lock()
-	b.wasPrinting[checkpoint.PrinterID] = false
-	delete(b.currentJobFile, checkpoint.PrinterID)
-	delete(b.currentJobName, checkpoint.PrinterID)
-	delete(b.currentJobUsage, checkpoint.PrinterID)
-	b.mutex.Unlock()
 	return nil
-}
-
-func (b *FilamentBridge) syncLegacyJobTracking(checkpoint *printerJobCheckpoint) {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
-	b.wasPrinting[checkpoint.PrinterID] = true
-	b.currentJobFile[checkpoint.PrinterID] = checkpoint.SourcePath
-	b.currentJobName[checkpoint.PrinterID] = checkpoint.JobName
-	b.currentJobUsage[checkpoint.PrinterID] = cloneFilamentUsage(checkpoint.FilamentUsage)
 }
 
 func nullableString(value string) interface{} {
@@ -494,6 +465,7 @@ func nullableString(value string) interface{} {
 }
 
 func (b *FilamentBridge) processDurableJobAdjustment(checkpoint *printerJobCheckpoint, logicalToolID int, physicalToolheadID int, spoolID int, filamentUsed float64, authority ConsumptionAuthority, jobName string, sourcePath string, printState string) error {
+	spoolman := b.spoolmanSnapshot()
 	if err := b.renewCheckpointLease(checkpoint); err != nil {
 		return err
 	}
@@ -540,7 +512,7 @@ func (b *FilamentBridge) processDurableJobAdjustment(checkpoint *printerJobCheck
 	}
 
 	if authority == ConsumptionAuthoritySpoolmanLed && spoolID > 0 {
-		spool, err := b.spoolman.GetSpool(spoolID)
+		spool, err := spoolman.GetSpool(spoolID)
 		if err != nil {
 			return fmt.Errorf("failed to inspect spool %d before durable update: %w", spoolID, err)
 		}
@@ -586,7 +558,7 @@ func (b *FilamentBridge) processDurableJobAdjustment(checkpoint *printerJobCheck
 			if spool.FirstUsed == "" {
 				update["first_used"] = time.Now().UTC().Format(time.RFC3339)
 			}
-			if err := b.spoolman.UpdateSpool(spoolID, update); err != nil {
+			if err := spoolman.UpdateSpool(spoolID, update); err != nil {
 				message := fmt.Sprintf("durable update of spool %d failed: %v", spoolID, err)
 				_, _ = b.db.Exec(`
 					UPDATE printer_job_adjustments SET last_error = ?, updated_at = ?
@@ -608,10 +580,10 @@ func (b *FilamentBridge) processDurableJobAdjustment(checkpoint *printerJobCheck
 	defer func() { _ = tx.Rollback() }()
 	_, err = tx.Exec(`
 		INSERT OR IGNORE INTO print_history (
-			printer_name, toolhead_id, spool_id, filament_used, print_started,
+			printer_id, printer_name_at_event, toolhead_id, spool_id, filament_used, print_started,
 			print_finished, job_name, source_path, print_state, accounting_key
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, checkpoint.PrinterName, physicalToolheadID, nullableSpoolID, filamentUsed,
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, checkpoint.PrinterID, checkpoint.PrinterName, physicalToolheadID, nullableSpoolID, filamentUsed,
 		checkpoint.StartedAt, time.Now().UTC(), jobName, sourcePath, printState, accountingKey)
 	if err != nil {
 		return fmt.Errorf("failed to record durable print history: %w", err)

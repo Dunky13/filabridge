@@ -1,0 +1,53 @@
+name: Promote Latest Container
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+# Promotion is optional post-release work. GitHub may replace a pending member
+# of this group, which is safe because each run re-checks the highest stable tag.
+concurrency:
+  group: filabridge-container-latest-promotion
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.event.release.draft == false && github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Checkout release tags
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+      - name: Re-check rolling latest eligibility
+        id: promotion
+        run: |
+          enabled="$(bash scripts/should-publish-latest.sh "$RELEASE_TAG")"
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+      - name: Compute image reference
+        if: steps.promotion.outputs.enabled == 'true'
+        id: image
+        run: echo "ref=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Log in to GitHub Container Registry
+        if: steps.promotion.outputs.enabled == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        if: steps.promotion.outputs.enabled == 'true'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Promote immutable image manifest
+        if: steps.promotion.outputs.enabled == 'true'
+        run: |
+          docker buildx imagetools create \
+            --tag "${{ steps.image.outputs.ref }}:latest" \
+            "${{ steps.image.outputs.ref }}:$RELEASE_TAG"

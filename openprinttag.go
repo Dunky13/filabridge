@@ -85,9 +85,9 @@ func (b *FilamentBridge) SetSpoolConsumptionAuthority(spoolID int, authority Con
 
 func (b *FilamentBridge) GetSpoolConsumptionAuthority(spoolID int) (ConsumptionAuthority, error) {
 	defaultAuthority := ConsumptionAuthoritySpoolmanLed
-	if b.config != nil {
+	if config := b.GetConfigSnapshot(); config != nil {
 		var err error
-		defaultAuthority, err = ParseConsumptionAuthority(string(b.config.ConsumptionAuthority))
+		defaultAuthority, err = ParseConsumptionAuthority(string(config.ConsumptionAuthority))
 		if err != nil {
 			return "", err
 		}
