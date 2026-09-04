@@ -14,8 +14,8 @@ I run multiple 3D printers and use Spoolman to track my filament inventory. The 
 
 - 🔗 **PrusaLink Compatibility**: Works with any PrusaLink-compatible printer (Prusa CORE One, XL, MK4, Mini, and more)
 - 📊 **Real-time Dashboard**: Web interface with live updates via WebSocket connections
-- 🎯 **Multi-Toolhead Support**: Seamlessly handles single and multi-toolhead printers (tested with 5-toolhead Prusa XL)
-- 📈 **Smart Usage Tracking**: Automatically parses G-code files to accurately track filament consumption per toolhead
+- 🎯 **Multi-Toolhead Support**: Handles XL and CORE One/CORE One L INDX configurations up to 8 toolheads
+- 📈 **Smart Usage Tracking**: Parses ASCII G-code and checksum-validated BGCode metadata per logical tool
 - 💾 **Persistent Storage**: SQLite database stores toolhead mappings and complete print history
 - ⚡ **High Performance**: Single lightweight binary, minimal resource usage, fast execution
 - 🔧 **Web-based Config**: No config files needed - manage everything through the web UI
@@ -26,6 +26,22 @@ I run multiple 3D printers and use Spoolman to track my filament inventory. The 
 - 🏷️ **NFC Tag Support**: Generate QR codes and program NFC tags for spools, filaments, and locations
 - 📱 **Smart Scanning**: Two-step NFC workflow - scan spool + location (or location + spool) for instant assignment
 - 📍 **Location Tracking**: Track spools in custom locations (dryboxes) or printer toolheads
+
+## PrusaSlicer 3 and current firmware
+
+FilaBridge supports PrusaSlicer 3.0's G-code metadata contract and its compressed BGCode container. Printer settings include current Prusa models plus CORE One and CORE One L/L+ INDX 4T/8T preview configurations. Logical slicer tools can be routed independently to physical material inputs.
+
+PrusaLink connections accept hostnames or full HTTP/HTTPS URLs, API-key or Digest authentication, and custom CA certificates. Stored credentials are write-only in the API. `/api/version` diagnostics expose firmware and advertised capabilities. Persistent per-tool accounting retains prints through pause/attention/busy states, retries, and service restarts; stopped/error jobs are recorded without deducting planned filament. Ambiguous jobs are held for explicit `FINISHED` or `STOPPED` resolution through `/api/printers/:id/job-reconciliation` instead of being guessed.
+
+OpenPrintTag remains capability-gated. Choose one consumption authority in Settings:
+
+- `spoolman-led`: completed jobs update Spoolman automatically (default)
+- `tag-led`: printer/tag owns consumption; FilaBridge records observations only
+- `observed-only`: no automatic inventory mutation
+
+Spoolman tag lookup and association are exposed only when its OpenAPI schema advertises them (`/api/spoolman/capabilities`, `/api/spoolman/tags/:uid`, and `/api/spools/:id/tags`). Tag-content synchronization remains disabled until released firmware and Spoolman APIs define that transport.
+
+Compatibility baseline and source evidence: [PrusaSlicer 3.0 compatibility research](../docs/research/prusaslicer-3.0-filabridge-compatibility.md).
 
 ## Why FilaBridge?
 

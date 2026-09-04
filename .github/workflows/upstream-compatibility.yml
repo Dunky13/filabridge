@@ -1,0 +1,19 @@
+name: Upstream compatibility watch
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  releases:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check pinned upstream releases
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/check-upstream-releases.sh

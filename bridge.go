@@ -1,13 +1,16 @@
 package main
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,17 +20,29 @@ import (
 
 // FilamentBridge manages the connection between PrusaLink and Spoolman
 type FilamentBridge struct {
-	config           *Config
-	spoolman         *SpoolmanClient
-	db               *sql.DB
-	wasPrinting      map[string]bool
-	currentJobFile   map[string]string // Store PrusaLink storage path per printer
-	currentJobName   map[string]string // Store human-readable job name per printer
-	currentJobUsage  map[string]map[int]float64
-	processingPrints map[string]bool       // Track prints being processed
-	printErrors      map[string]PrintError // Store print processing errors
-	errorMutex       sync.RWMutex
-	mutex            sync.RWMutex
+	config            *Config
+	spoolman          *SpoolmanClient
+	db                *sql.DB
+	wasPrinting       map[string]bool
+	currentJobFile    map[string]string // Store PrusaLink storage path per printer
+	currentJobName    map[string]string // Store human-readable job name per printer
+	currentJobUsage   map[string]map[int]float64
+	processingPrints  map[string]bool // Track prints being processed
+	printerJobLocks   map[string]*sync.Mutex
+	printerJobLocksMu sync.Mutex
+	instanceID        string
+	diagnosticsLogged map[string]bool
+	printErrors       map[string]PrintError // Store print processing errors
+	errorMutex        sync.RWMutex
+	mutex             sync.RWMutex
+}
+
+func newBridgeInstanceID() string {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err == nil {
+		return hex.EncodeToString(bytes)
+	}
+	return fmt.Sprintf("instance-%d", time.Now().UnixNano())
 }
 
 // ToolheadMapping represents a mapping between a printer toolhead and a spool
@@ -51,6 +66,7 @@ type PrintHistory struct {
 	PrintFinished time.Time `json:"print_finished"`
 	JobName       string    `json:"job_name"`
 	SourcePath    string    `json:"source_path,omitempty"`
+	PrintState    string    `json:"print_state,omitempty"`
 }
 
 // PrintError represents a failed print processing attempt
@@ -83,14 +99,17 @@ type PrinterData struct {
 // NewFilamentBridge creates a new FilamentBridge instance
 func NewFilamentBridge(config *Config) (*FilamentBridge, error) {
 	bridge := &FilamentBridge{
-		config:           config,
-		spoolman:         NewSpoolmanClient(DefaultSpoolmanURL, SpoolmanTimeout, "", ""), // Default URL and timeout, will be updated
-		wasPrinting:      make(map[string]bool),
-		currentJobFile:   make(map[string]string),
-		currentJobName:   make(map[string]string),
-		currentJobUsage:  make(map[string]map[int]float64),
-		processingPrints: make(map[string]bool),
-		printErrors:      make(map[string]PrintError),
+		config:            config,
+		spoolman:          NewSpoolmanClient(DefaultSpoolmanURL, SpoolmanTimeout, "", ""), // Default URL and timeout, will be updated
+		wasPrinting:       make(map[string]bool),
+		currentJobFile:    make(map[string]string),
+		currentJobName:    make(map[string]string),
+		currentJobUsage:   make(map[string]map[int]float64),
+		processingPrints:  make(map[string]bool),
+		printerJobLocks:   make(map[string]*sync.Mutex),
+		diagnosticsLogged: make(map[string]bool),
+		instanceID:        newBridgeInstanceID(),
+		printErrors:       make(map[string]PrintError),
 	}
 
 	// Initialize database
@@ -138,6 +157,9 @@ func (b *FilamentBridge) initDatabase() error {
 			model TEXT,
 			ip_address TEXT NOT NULL,
 			api_key TEXT,
+			prusalink_username TEXT NOT NULL DEFAULT '',
+			prusalink_password TEXT NOT NULL DEFAULT '',
+			prusalink_custom_ca_pem TEXT NOT NULL DEFAULT '',
 			toolheads INTEGER DEFAULT 1,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -163,7 +185,40 @@ func (b *FilamentBridge) initDatabase() error {
 			external_job_id TEXT,
 			external_lifetime_id TEXT,
 			external_printer_uuid TEXT,
-			print_state TEXT
+			print_state TEXT,
+			accounting_key TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS printer_job_checkpoints (
+			printer_id TEXT PRIMARY KEY,
+			printer_name TEXT NOT NULL,
+			prusalink_job_id INTEGER,
+			source_path TEXT NOT NULL,
+			job_name TEXT NOT NULL,
+			filament_usage_json TEXT NOT NULL DEFAULT '{}',
+			tool_assignments_json TEXT NOT NULL DEFAULT '{}',
+			last_state TEXT NOT NULL,
+			progress REAL NOT NULL DEFAULT 0,
+			started_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL,
+			accounting_status TEXT NOT NULL DEFAULT 'pending',
+			terminal_state TEXT,
+			accounting_owner TEXT,
+			accounting_lease_until INTEGER
+		)`,
+		`CREATE TABLE IF NOT EXISTS printer_job_adjustments (
+			printer_id TEXT NOT NULL,
+			checkpoint_started_at TIMESTAMP NOT NULL,
+			logical_tool_id INTEGER NOT NULL,
+			physical_toolhead_id INTEGER NOT NULL,
+			spool_id INTEGER,
+			filament_used REAL NOT NULL,
+			authority TEXT NOT NULL,
+			used_weight_before REAL,
+			used_weight_after REAL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			last_error TEXT,
+			updated_at TIMESTAMP NOT NULL,
+			PRIMARY KEY (printer_id, checkpoint_started_at, logical_tool_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS nfc_sessions (
 			session_id TEXT PRIMARY KEY,
@@ -181,12 +236,30 @@ func (b *FilamentBridge) initDatabase() error {
 			display_name TEXT NOT NULL,
 			PRIMARY KEY (printer_id, toolhead_id)
 		)`,
+		`CREATE TABLE IF NOT EXISTS logical_tool_routes (
+			printer_id TEXT NOT NULL,
+			logical_tool_id INTEGER NOT NULL,
+			physical_toolhead_id INTEGER NOT NULL,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (printer_id, logical_tool_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS spool_consumption_authorities (
+			spool_id INTEGER PRIMARY KEY,
+			authority TEXT NOT NULL,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
 	}
 
 	for _, query := range createTables {
 		if _, err := b.db.Exec(query); err != nil {
 			return fmt.Errorf("failed to create table: %w", err)
 		}
+	}
+	if err := b.ensurePrinterProtocolSchema(); err != nil {
+		return fmt.Errorf("failed to migrate printer protocol schema: %w", err)
+	}
+	if err := b.ensureJobCheckpointSchema(); err != nil {
+		return fmt.Errorf("failed to migrate printer job checkpoint schema: %w", err)
 	}
 
 	if err := b.ensurePrintHistoryImportSchema(); err != nil {
@@ -351,6 +424,7 @@ func (b *FilamentBridge) initializeDefaultConfig() error {
 		ConfigKeySpoolmanURL:                     DefaultSpoolmanURL,
 		ConfigKeySpoolmanUsername:                "", // Spoolman basic auth username (optional)
 		ConfigKeySpoolmanPassword:                "", // Spoolman basic auth password (optional)
+		ConfigKeyConsumptionAuthority:            string(ConsumptionAuthoritySpoolmanLed),
 		ConfigKeyPollInterval:                    fmt.Sprintf("%d", DefaultPollInterval),
 		ConfigKeyWebPort:                         DefaultWebPort,
 		ConfigKeyPrusaLinkTimeout:                fmt.Sprintf("%d", PrusaLinkTimeout),
@@ -360,23 +434,14 @@ func (b *FilamentBridge) initializeDefaultConfig() error {
 		ConfigKeyAutoAssignPreviousSpoolLocation: "",      // Default location name for auto-assigned previous spools
 	}
 
-	// Check if this is a fresh installation by checking if any config exists
-	var totalCount int
-	err := b.db.QueryRow("SELECT COUNT(*) FROM configuration").Scan(&totalCount)
-	if err != nil {
-		return fmt.Errorf("failed to check config existence: %w", err)
-	}
-
-	// Only insert defaults if this is a fresh installation
-	if totalCount == 0 {
-		for key, value := range defaultConfigs {
-			_, err := b.db.Exec(
-				"INSERT INTO configuration (key, value, description) VALUES (?, ?, ?)",
-				key, value, getConfigDescription(key),
-			)
-			if err != nil {
-				return fmt.Errorf("failed to insert default config %s: %w", key, err)
-			}
+	// INSERT OR IGNORE doubles as a forward migration when new defaults are added.
+	for key, value := range defaultConfigs {
+		_, err := b.db.Exec(
+			"INSERT OR IGNORE INTO configuration (key, value, description) VALUES (?, ?, ?)",
+			key, value, getConfigDescription(key),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert default config %s: %w", key, err)
 		}
 	}
 
@@ -391,6 +456,7 @@ func getConfigDescription(key string) string {
 		ConfigKeySpoolmanURL:                     "URL of Spoolman instance",
 		ConfigKeySpoolmanUsername:                "Spoolman basic auth username (optional, leave empty if not using basic auth)",
 		ConfigKeySpoolmanPassword:                "Spoolman basic auth password (optional, leave empty if not using basic auth)",
+		ConfigKeyConsumptionAuthority:            "Sole source allowed to author filament consumption: spoolman-led, tag-led, or observed-only",
 		ConfigKeyPollInterval:                    "Polling interval in seconds",
 		ConfigKeyWebPort:                         "Port for web interface",
 		ConfigKeyPrusaLinkTimeout:                "PrusaLink API timeout in seconds",
@@ -653,7 +719,7 @@ func (b *FilamentBridge) SwitchToolheadSpool(printerName string, toolheadID int,
 
 // GetAllPrinterConfigs gets all printer configurations
 func (b *FilamentBridge) GetAllPrinterConfigs() (map[string]PrinterConfig, error) {
-	rows, err := b.db.Query("SELECT printer_id, name, model, ip_address, api_key, toolheads FROM printer_configs")
+	rows, err := b.db.Query("SELECT printer_id, name, model, ip_address, api_key, prusalink_username, prusalink_password, prusalink_custom_ca_pem, toolheads FROM printer_configs")
 	if err != nil {
 		return nil, fmt.Errorf("failed to get printer configs: %w", err)
 	}
@@ -661,17 +727,20 @@ func (b *FilamentBridge) GetAllPrinterConfigs() (map[string]PrinterConfig, error
 
 	configs := make(map[string]PrinterConfig)
 	for rows.Next() {
-		var printerID, name, model, ipAddress, apiKey string
+		var printerID, name, model, ipAddress, apiKey, username, password, customCAPEM string
 		var toolheads int
-		if err := rows.Scan(&printerID, &name, &model, &ipAddress, &apiKey, &toolheads); err != nil {
+		if err := rows.Scan(&printerID, &name, &model, &ipAddress, &apiKey, &username, &password, &customCAPEM, &toolheads); err != nil {
 			return nil, fmt.Errorf("failed to scan printer config row: %w", err)
 		}
 		configs[printerID] = PrinterConfig{
-			Name:      name,
-			Model:     model,
-			IPAddress: ipAddress,
-			APIKey:    apiKey,
-			Toolheads: toolheads,
+			Name:                 name,
+			Model:                model,
+			IPAddress:            ipAddress,
+			APIKey:               apiKey,
+			PrusaLinkUsername:    username,
+			PrusaLinkPassword:    password,
+			PrusaLinkCustomCAPEM: customCAPEM,
+			Toolheads:            toolheads,
 		}
 	}
 
@@ -684,9 +753,12 @@ func (b *FilamentBridge) SavePrinterConfig(printerID string, config PrinterConfi
 	defer b.mutex.Unlock()
 
 	_, err := b.db.Exec(`
-		INSERT OR REPLACE INTO printer_configs (printer_id, name, model, ip_address, api_key, toolheads)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, printerID, config.Name, config.Model, config.IPAddress, config.APIKey, config.Toolheads)
+		INSERT OR REPLACE INTO printer_configs (
+			printer_id, name, model, ip_address, api_key, prusalink_username,
+			prusalink_password, prusalink_custom_ca_pem, toolheads
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, printerID, config.Name, config.Model, config.IPAddress, config.APIKey,
+		config.PrusaLinkUsername, config.PrusaLinkPassword, config.PrusaLinkCustomCAPEM, config.Toolheads)
 	if err != nil {
 		return fmt.Errorf("failed to save printer config: %w", err)
 	}
@@ -698,11 +770,27 @@ func (b *FilamentBridge) DeletePrinterConfig(printerID string) error {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
-	_, err := b.db.Exec("DELETE FROM printer_configs WHERE printer_id = ?", printerID)
+	tx, err := b.db.Begin()
 	if err != nil {
+		return fmt.Errorf("failed to begin printer deletion: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec("DELETE FROM logical_tool_routes WHERE printer_id = ?", printerID); err != nil {
+		return fmt.Errorf("failed to delete logical tool routes: %w", err)
+	}
+	if _, err := tx.Exec("DELETE FROM printer_job_checkpoints WHERE printer_id = ?", printerID); err != nil {
+		return fmt.Errorf("failed to delete printer job checkpoint: %w", err)
+	}
+	if _, err := tx.Exec("DELETE FROM printer_job_adjustments WHERE printer_id = ?", printerID); err != nil {
+		return fmt.Errorf("failed to delete printer job adjustments: %w", err)
+	}
+	if _, err := tx.Exec("DELETE FROM toolhead_names WHERE printer_id = ?", printerID); err != nil {
+		return fmt.Errorf("failed to delete toolhead names: %w", err)
+	}
+	if _, err := tx.Exec("DELETE FROM printer_configs WHERE printer_id = ?", printerID); err != nil {
 		return fmt.Errorf("failed to delete printer config: %w", err)
 	}
-	return nil
+	return tx.Commit()
 }
 
 // GetToolheadName gets the display name for a toolhead, or returns default "Toolhead {ID}"
@@ -846,12 +934,15 @@ func (b *FilamentBridge) GetConfigSnapshot() *Config {
 	// Create a shallow copy of the config
 	configCopy := &Config{
 		SpoolmanURL:                  b.config.SpoolmanURL,
+		SpoolmanUsername:             b.config.SpoolmanUsername,
+		SpoolmanPassword:             b.config.SpoolmanPassword,
 		PollInterval:                 b.config.PollInterval,
 		DBFile:                       b.config.DBFile,
 		WebPort:                      b.config.WebPort,
 		PrusaLinkTimeout:             b.config.PrusaLinkTimeout,
 		PrusaLinkFileDownloadTimeout: b.config.PrusaLinkFileDownloadTimeout,
 		SpoolmanTimeout:              b.config.SpoolmanTimeout,
+		ConsumptionAuthority:         b.config.ConsumptionAuthority,
 		Printers:                     make(map[string]PrinterConfig),
 	}
 
@@ -874,6 +965,7 @@ func (b *FilamentBridge) ReloadConfig() error {
 	// Only lock briefly to swap the config pointer and recreate SpoolmanClient
 	b.mutex.Lock()
 	b.config = config
+	b.diagnosticsLogged = make(map[string]bool)
 	if config.SpoolmanURL != "" {
 		b.spoolman = NewSpoolmanClient(config.SpoolmanURL, config.SpoolmanTimeout, config.SpoolmanUsername, config.SpoolmanPassword)
 	}
@@ -900,6 +992,7 @@ func (b *FilamentBridge) UpdateConfig(config *Config) error {
 	defer b.mutex.Unlock()
 
 	b.config = config
+	b.diagnosticsLogged = make(map[string]bool)
 	b.spoolman = NewSpoolmanClient(config.SpoolmanURL, config.SpoolmanTimeout, config.SpoolmanUsername, config.SpoolmanPassword)
 
 	return nil
@@ -1071,6 +1164,10 @@ func (b *FilamentBridge) LogPrintUsage(printerName string, toolheadID int, spool
 
 // LogPrintUsageWithSourcePath logs filament usage and retains the printer file path when known.
 func (b *FilamentBridge) LogPrintUsageWithSourcePath(printerName string, toolheadID int, spoolID *int, filamentUsed float64, jobName string, sourcePath string) error {
+	return b.logPrintUsageWithState(printerName, toolheadID, spoolID, filamentUsed, jobName, sourcePath, StateFinished)
+}
+
+func (b *FilamentBridge) logPrintUsageWithState(printerName string, toolheadID int, spoolID *int, filamentUsed float64, jobName string, sourcePath string, printState string) error {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
@@ -1083,8 +1180,8 @@ func (b *FilamentBridge) LogPrintUsageWithSourcePath(printerName string, toolhea
 	}
 
 	_, err := b.db.Exec(
-		"INSERT INTO print_history (printer_name, toolhead_id, spool_id, filament_used, print_started, print_finished, job_name, source_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		printerName, toolheadID, spoolID, filamentUsed, printStarted, time.Now(), jobName, strings.TrimSpace(sourcePath),
+		"INSERT INTO print_history (printer_name, toolhead_id, spool_id, filament_used, print_started, print_finished, job_name, source_path, print_state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		printerName, toolheadID, spoolID, filamentUsed, printStarted, time.Now(), jobName, strings.TrimSpace(sourcePath), printState,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to log print usage: %w", err)
@@ -1122,7 +1219,7 @@ func (b *FilamentBridge) GetPrintHistory(limit int) ([]PrintHistory, error) {
 	}
 
 	rows, err := b.db.Query(`
-		SELECT id, printer_name, toolhead_id, spool_id, filament_used, print_started, print_finished, job_name, source_path
+		SELECT id, printer_name, toolhead_id, spool_id, filament_used, print_started, print_finished, job_name, source_path, COALESCE(print_state, '')
 		FROM print_history
 		ORDER BY print_finished DESC, id DESC
 		LIMIT ?
@@ -1147,6 +1244,7 @@ func (b *FilamentBridge) GetPrintHistory(limit int) ([]PrintHistory, error) {
 			&entry.PrintFinished,
 			&entry.JobName,
 			&sourcePath,
+			&entry.PrintState,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan print history row: %w", err)
 		}
@@ -1175,7 +1273,7 @@ func (b *FilamentBridge) getPrintHistoryByID(historyID int) (*PrintHistory, erro
 	var spoolID sql.NullInt64
 	var sourcePath sql.NullString
 	err := b.db.QueryRow(`
-		SELECT id, printer_name, toolhead_id, spool_id, filament_used, print_started, print_finished, job_name, source_path
+		SELECT id, printer_name, toolhead_id, spool_id, filament_used, print_started, print_finished, job_name, source_path, COALESCE(print_state, '')
 		FROM print_history
 		WHERE id = ?
 	`, historyID).Scan(
@@ -1188,6 +1286,7 @@ func (b *FilamentBridge) getPrintHistoryByID(historyID int) (*PrintHistory, erro
 		&entry.PrintFinished,
 		&entry.JobName,
 		&sourcePath,
+		&entry.PrintState,
 	)
 	if err == sql.ErrNoRows {
 		return nil, fmt.Errorf("print history entry %d not found", historyID)
@@ -1264,7 +1363,10 @@ func (b *FilamentBridge) RefreshPrintHistoryFilamentUsage(historyID int, spoolID
 		return nil, err
 	}
 
-	prusaClient := NewPrusaLinkClient(printerConfig.IPAddress, printerConfig.APIKey, b.config.PrusaLinkTimeout, b.config.PrusaLinkFileDownloadTimeout)
+	prusaClient, err := newConfiguredPrusaLinkClient(printerConfig, b.config.PrusaLinkTimeout, b.config.PrusaLinkFileDownloadTimeout)
+	if err != nil {
+		return nil, err
+	}
 
 	sourcePath := strings.TrimSpace(entry.SourcePath)
 	if sourcePath == "" {
@@ -1419,8 +1521,16 @@ func (b *FilamentBridge) MonitorPrinters() {
 
 // monitorPrusaLink monitors a single printer using PrusaLink API
 func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig) error {
+	jobLock := b.printerJobLock(printerID)
+	jobLock.Lock()
+	defer jobLock.Unlock()
+
 	log.Printf("Starting monitoring for printer %s (%s) at %s", printerID, config.IPAddress, config.Name)
-	client := NewPrusaLinkClient(config.IPAddress, config.APIKey, b.config.PrusaLinkTimeout, b.config.PrusaLinkFileDownloadTimeout)
+	client, err := newConfiguredPrusaLinkClient(config, b.config.PrusaLinkTimeout, b.config.PrusaLinkFileDownloadTimeout)
+	if err != nil {
+		return fmt.Errorf("invalid PrusaLink configuration: %w", err)
+	}
+	b.logPrusaLinkDiagnosticsOnce(printerID, client)
 
 	status, err := client.GetStatus()
 	if err != nil {
@@ -1447,100 +1557,21 @@ func (b *FilamentBridge) monitorPrusaLink(printerID string, config PrinterConfig
 
 	currentJobUsage := cloneFilamentUsage(jobInfo.FilamentUsageByToolhead())
 
-	// Check if print just finished - minimize lock scope
-	b.mutex.RLock()
-	wasPrinting := b.wasPrinting[printerID]
-	storedJobFile := b.currentJobFile[printerID]
-	storedJobName := b.currentJobName[printerID]
-	storedJobUsage := cloneFilamentUsage(b.currentJobUsage[printerID])
-	b.mutex.RUnlock()
-
-	// Debug logging for all printers
-	log.Printf("Printer %s (%s): state=%s, wasPrinting=%v, job=%s, stored_file=%s",
-		config.IPAddress, printerID, currentState, wasPrinting, jobName, storedJobFile)
-
-	// Check if print just finished
-	if (currentState == StateIdle || currentState == StateFinished) && wasPrinting {
-		// Use stored filename (should be available since we stored it when printing started)
-		filenameToUse := storedJobFile
-		jobNameToUse := storedJobName
-		filamentUsageToUse := currentJobUsage
-		if len(filamentUsageToUse) == 0 {
-			filamentUsageToUse = storedJobUsage
-		}
-		if filenameToUse == "" {
-			log.Printf("Warning: No stored filename for %s (%s), using current job filename: %s",
-				config.IPAddress, printerID, currentJobFilename)
-			filenameToUse = currentJobFilename
-		}
-		if jobNameToUse == "" {
-			jobNameToUse = currentJobDisplayName
-		}
-		if jobNameToUse == "" {
-			jobNameToUse = resolvePrusaJobName("", "", filenameToUse)
-		}
-
-		log.Printf("🎉 Print finished detected for %s (%s): %s (state: %s, file: %s)",
-			config.IPAddress, printerID, jobNameToUse, currentState, filenameToUse)
-
-		// Mark as processing to prevent filename from being cleared
-		b.mutex.Lock()
-		b.wasPrinting[printerID] = false
-		b.processingPrints[printerID] = true
-		b.mutex.Unlock()
-
-		// Now process the print (this takes a long time)
-		err := b.handlePrusaLinkPrintFinished(config, filenameToUse, jobNameToUse, filamentUsageToUse)
-
-		// Clear processing flag and filename after completion
-		b.mutex.Lock()
-		b.processingPrints[printerID] = false
-		if err == nil {
-			b.currentJobFile[printerID] = ""
-			delete(b.currentJobName, printerID)
-			delete(b.currentJobUsage, printerID)
-		}
-		b.mutex.Unlock()
-
-		if err != nil {
-			log.Printf("Error handling PrusaLink print finished: %v", err)
-		}
-	} else {
-		// Update state tracking - minimize lock scope
-		b.mutex.Lock()
-		defer b.mutex.Unlock()
-
-		// Store the current job filename when printing starts (only if not already stored)
-		if currentState == StatePrinting && currentJobFilename != "" {
-			if storedJobFile == "" {
-				b.currentJobFile[printerID] = currentJobFilename
-				log.Printf("📁 Stored job storage path for %s (%s): %s", config.IPAddress, printerID, currentJobFilename)
-			}
-			if storedJobName == "" && currentJobDisplayName != "" {
-				b.currentJobName[printerID] = currentJobDisplayName
-				log.Printf("📝 Stored job display name for %s (%s): %s", config.IPAddress, printerID, currentJobDisplayName)
-			}
-		}
-		if currentState == StatePrinting && len(currentJobUsage) > 0 {
-			b.currentJobUsage[printerID] = cloneFilamentUsage(currentJobUsage)
-		}
-
-		// Update wasPrinting flag for NEXT cycle
-		b.wasPrinting[printerID] = currentState == StatePrinting
-
-		// Clear stored filename when print finishes (but only if not currently processing)
-		if (currentState == StateIdle || currentState == StateFinished) && !b.processingPrints[printerID] {
-			b.currentJobFile[printerID] = ""
-			delete(b.currentJobName, printerID)
-			delete(b.currentJobUsage, printerID)
-		}
-	}
-
-	return nil
+	log.Printf("Printer %s (%s): state=%s, job=%s, file=%s",
+		config.IPAddress, printerID, currentState, jobName, currentJobFilename)
+	return b.reconcilePrusaLinkJob(printerID, config, status, jobInfo, currentJobFilename, currentJobDisplayName, currentJobUsage)
 }
 
 // handlePrusaLinkPrintFinished handles when a print job finishes via PrusaLink
 func (b *FilamentBridge) handlePrusaLinkPrintFinished(config PrinterConfig, storagePath string, jobName string, filamentUsage map[int]float64) error {
+	return b.handlePrusaLinkPrintFinishedWithMappings(config, storagePath, jobName, filamentUsage, nil, StateFinished)
+}
+
+func (b *FilamentBridge) handlePrusaLinkPrintFinishedWithMappings(config PrinterConfig, storagePath string, jobName string, filamentUsage map[int]float64, toolAssignments map[int]PrintToolAssignment, printState string) error {
+	return b.handlePrusaLinkPrintFinishedWithCheckpoint(config, storagePath, jobName, filamentUsage, toolAssignments, printState, nil)
+}
+
+func (b *FilamentBridge) handlePrusaLinkPrintFinishedWithCheckpoint(config PrinterConfig, storagePath string, jobName string, filamentUsage map[int]float64, toolAssignments map[int]PrintToolAssignment, printState string, checkpoint *printerJobCheckpoint) error {
 	if jobName == "" {
 		jobName = resolvePrusaJobName("", "", storagePath)
 	}
@@ -1561,7 +1592,10 @@ func (b *FilamentBridge) handlePrusaLinkPrintFinished(config PrinterConfig, stor
 	} else {
 		log.Printf("Fetching print file metadata for filament usage: %s", storagePath)
 
-		prusaClient := NewPrusaLinkClient(config.IPAddress, config.APIKey, b.config.PrusaLinkTimeout, b.config.PrusaLinkFileDownloadTimeout)
+		prusaClient, err := newConfiguredPrusaLinkClient(config, b.config.PrusaLinkTimeout, b.config.PrusaLinkFileDownloadTimeout)
+		if err != nil {
+			return fmt.Errorf("invalid PrusaLink configuration: %w", err)
+		}
 		resolvedUsage, err := prusaClient.GetFilamentUsageForFile(storagePath)
 		if err != nil {
 			errorMsg := fmt.Sprintf("failed to extract filament usage from PrusaLink: %v", err)
@@ -1580,7 +1614,7 @@ func (b *FilamentBridge) handlePrusaLinkPrintFinished(config PrinterConfig, stor
 	log.Printf("Successfully collected filament usage: %+v", filamentUsage)
 
 	// Process filament usage using helper function
-	if err := b.processFilamentUsage(printerName, filamentUsage, jobName, storagePath); err != nil {
+	if err := b.processFilamentUsageWithCheckpoint(printerName, filamentUsage, jobName, storagePath, toolAssignments, printState, checkpoint); err != nil {
 		log.Printf("Error processing filament usage: %v", err)
 		return err
 	}
@@ -1778,7 +1812,11 @@ func (b *FilamentBridge) GetStatus() (*PrinterStatus, error) {
 				continue // Skip placeholder
 			}
 
-			client := NewPrusaLinkClient(printerConfig.IPAddress, printerConfig.APIKey, b.config.PrusaLinkTimeout, b.config.PrusaLinkFileDownloadTimeout)
+			client, err := newConfiguredPrusaLinkClient(printerConfig, b.config.PrusaLinkTimeout, b.config.PrusaLinkFileDownloadTimeout)
+			if err != nil {
+				status.Printers[printerID] = PrinterData{Name: printerConfig.Name, State: StateOffline}
+				continue
+			}
 
 			// Use the configured printer name, not the hostname from PrusaLink
 			printerName := printerConfig.Name
@@ -1885,37 +1923,103 @@ func (b *FilamentBridge) GetStatus() (*PrinterStatus, error) {
 
 // processFilamentUsage processes filament usage updates for all toolheads
 func (b *FilamentBridge) processFilamentUsage(printerName string, filamentUsage map[int]float64, jobName string, sourcePath string) error {
-	// Update Spoolman with filament usage for each toolhead
-	for toolheadID, usedWeight := range filamentUsage {
+	return b.processFilamentUsageWithMappings(printerName, filamentUsage, jobName, sourcePath, nil, StateFinished)
+}
+
+func (b *FilamentBridge) processFilamentUsageWithMappings(printerName string, filamentUsage map[int]float64, jobName string, sourcePath string, toolAssignments map[int]PrintToolAssignment, printState string) error {
+	return b.processFilamentUsageWithCheckpoint(printerName, filamentUsage, jobName, sourcePath, toolAssignments, printState, nil)
+}
+
+func (b *FilamentBridge) processFilamentUsageWithCheckpoint(printerName string, filamentUsage map[int]float64, jobName string, sourcePath string, toolAssignments map[int]PrintToolAssignment, printState string, checkpoint *printerJobCheckpoint) error {
+	defaultAuthority := ConsumptionAuthoritySpoolmanLed
+	if b.config != nil {
+		var err error
+		defaultAuthority, err = ParseConsumptionAuthority(string(b.config.ConsumptionAuthority))
+		if err != nil {
+			return err
+		}
+	}
+
+	logicalToolIDs := make([]int, 0, len(filamentUsage))
+	for logicalToolID := range filamentUsage {
+		logicalToolIDs = append(logicalToolIDs, logicalToolID)
+	}
+	sort.Ints(logicalToolIDs)
+
+	// Update Spoolman with filament usage for each toolhead.
+	for _, logicalToolID := range logicalToolIDs {
+		usedWeight := filamentUsage[logicalToolID]
 		if usedWeight <= 0 {
 			continue
 		}
 
 		// Get the mapped spool for this toolhead
-		spoolID, err := b.GetToolheadMapping(printerName, toolheadID)
-		if err != nil {
-			log.Printf("Error getting toolhead mapping for %s toolhead %d: %v",
-				printerName, toolheadID, err)
-			continue
+		toolheadID := logicalToolID
+		spoolID := 0
+		authority := defaultAuthority
+		if toolAssignments == nil {
+			var err error
+			toolheadID, err = b.ResolveLogicalToolRoute(printerName, logicalToolID)
+			if err != nil {
+				return fmt.Errorf("failed to resolve logical tool %d for %s: %w", logicalToolID, printerName, err)
+			}
+			spoolID, err = b.GetToolheadMapping(printerName, toolheadID)
+			if err != nil {
+				return fmt.Errorf("failed to get toolhead mapping for %s toolhead %d: %w", printerName, toolheadID, err)
+			}
+			authority, err = b.GetSpoolConsumptionAuthority(spoolID)
+			if err != nil {
+				return fmt.Errorf("failed to get consumption authority for spool %d: %w", spoolID, err)
+			}
+		} else if assignment, ok := toolAssignments[logicalToolID]; ok {
+			toolheadID = assignment.PhysicalToolheadID
+			spoolID = assignment.SpoolID
+			if assignment.Authority != "" {
+				var err error
+				authority, err = ParseConsumptionAuthority(string(assignment.Authority))
+				if err != nil {
+					return fmt.Errorf("invalid snapshotted consumption authority for logical tool %d: %w", logicalToolID, err)
+				}
+			} else {
+				var err error
+				authority, err = b.GetSpoolConsumptionAuthority(spoolID)
+				if err != nil {
+					return fmt.Errorf("failed to get consumption authority for spool %d: %w", spoolID, err)
+				}
+			}
+		}
+		if err := (ConsumptionUpdatePlan{
+			Authority:              authority,
+			AutomaticSpoolmanDebit: authority == ConsumptionAuthoritySpoolmanLed,
+		}).Validate(); err != nil {
+			return err
 		}
 
 		var historySpoolID *int
+		if checkpoint != nil {
+			if err := b.processDurableJobAdjustment(checkpoint, logicalToolID, toolheadID, spoolID, usedWeight, authority, jobName, sourcePath, printState); err != nil {
+				return err
+			}
+			continue
+		}
 		if spoolID == 0 {
 			log.Printf("No spool mapped to %s toolhead %d, logging history with unknown spool",
 				printerName, toolheadID)
 		} else {
-			// Update Spoolman
-			if err := b.spoolman.UpdateSpoolUsage(spoolID, usedWeight); err != nil {
-				log.Printf("Error updating spool %d usage: %v", spoolID, err)
-				continue
+			if authority == ConsumptionAuthoritySpoolmanLed {
+				if err := b.spoolman.UpdateSpoolUsage(spoolID, usedWeight); err != nil {
+					return fmt.Errorf("failed to update spool %d usage: %w", spoolID, err)
+				}
+			} else {
+				log.Printf("Observed %.2fg on spool %d without debit; consumption authority is %s", usedWeight, spoolID, authority)
 			}
 
 			historySpoolID = cloneIntPointer(&spoolID)
 		}
 
 		// Log the usage in our database
-		if err := b.LogPrintUsageWithSourcePath(printerName, toolheadID, historySpoolID, usedWeight, jobName, sourcePath); err != nil {
-			log.Printf("Error logging print usage: %v", err)
+		if err := b.logPrintUsageWithState(printerName, toolheadID, historySpoolID, usedWeight, jobName, sourcePath, printState); err != nil {
+			return fmt.Errorf("failed to log print usage: %w", err)
 		}
 
 		if historySpoolID != nil {

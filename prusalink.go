@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,14 +16,32 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/icholy/digest"
 )
 
 // PrusaLinkClient handles communication with PrusaLink API
 type PrusaLinkClient struct {
 	baseURL             string
 	apiKey              string
+	digestConfigured    bool
+	customCATrust       bool
 	httpClient          *http.Client
+	transportFactory    func(bool) http.RoundTripper
+	checkRedirect       func(*http.Request, []*http.Request) error
 	fileDownloadTimeout int
+}
+
+// PrusaLinkClientOptions configures transport and authentication for PrusaLink.
+// BaseURL may use HTTP or HTTPS. Hosts without a scheme retain legacy HTTP behavior.
+type PrusaLinkClientOptions struct {
+	BaseURL             string
+	APIKey              string
+	DigestUsername      string
+	DigestPassword      string
+	CustomCAPEM         []byte
+	Timeout             int
+	FileDownloadTimeout int
 }
 
 const prusaLinkDownloadSniffBytes = 256 * 1024
@@ -134,33 +155,214 @@ type PrusaLinkInfo struct {
 	MinExtrusionTemp int     `json:"min_extrusion_temp"`
 }
 
+// PrusaLinkCapabilities contains capabilities advertised by /api/version.
+type PrusaLinkCapabilities struct {
+	UploadByPut bool            `json:"upload-by-put"`
+	Advertised  map[string]bool `json:"-"`
+}
+
+// UnmarshalJSON preserves unknown boolean capabilities for future firmware versions.
+func (c *PrusaLinkCapabilities) UnmarshalJSON(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	c.Advertised = make(map[string]bool)
+	for name, valueJSON := range raw {
+		var value bool
+		if err := json.Unmarshal(valueJSON, &value); err != nil {
+			continue
+		}
+		c.Advertised[name] = value
+	}
+	c.UploadByPut = c.Advertised["upload-by-put"]
+	return nil
+}
+
+// Supports reports a boolean capability advertised by PrusaLink.
+func (c PrusaLinkCapabilities) Supports(name string) bool {
+	return c.Advertised[name]
+}
+
+// PrusaLinkVersion represents PrusaLink protocol, firmware, and printer versions.
+type PrusaLinkVersion struct {
+	API            string                `json:"api"`
+	Server         string                `json:"server"`
+	Text           string                `json:"text"`
+	Hostname       string                `json:"hostname"`
+	Firmware       string                `json:"firmware"`
+	Printer        string                `json:"printer"`
+	NozzleDiameter float64               `json:"nozzle_diameter"`
+	Capabilities   PrusaLinkCapabilities `json:"capabilities"`
+}
+
+// PrusaLinkDiagnostics is a credential-safe snapshot of negotiated printer connectivity.
+type PrusaLinkDiagnostics struct {
+	BaseURL        string
+	HTTPS          bool
+	CustomCATrust  bool
+	Authentication []string
+	API            string
+	Server         string
+	Hostname       string
+	Firmware       string
+	Printer        string
+	Capabilities   PrusaLinkCapabilities
+}
+
 // NewPrusaLinkClient creates a new PrusaLink client
 func NewPrusaLinkClient(ipAddress, apiKey string, timeout, fileDownloadTimeout int) *PrusaLinkClient {
-	// Create a custom dialer with timeout for DNS resolution
-	// This ensures hostnames (especially .local domains) have adequate time to resolve
-	dialer := &net.Dialer{
-		Timeout:   5 * time.Second, // DNS resolution timeout
-		KeepAlive: 30 * time.Second,
+	client, err := NewPrusaLinkClientWithOptions(PrusaLinkClientOptions{
+		BaseURL:             ipAddress,
+		APIKey:              apiKey,
+		Timeout:             timeout,
+		FileDownloadTimeout: fileDownloadTimeout,
+	})
+	if err != nil {
+		panic(fmt.Sprintf("invalid PrusaLink client configuration: %v", err))
+	}
+	return client
+}
+
+// NewPrusaLinkClientWithOptions creates a client with explicit transport and auth options.
+func NewPrusaLinkClientWithOptions(options PrusaLinkClientOptions) (*PrusaLinkClient, error) {
+	baseURL := strings.TrimRight(strings.TrimSpace(options.BaseURL), "/")
+	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
+		baseURL = "http://" + baseURL
+	}
+	parsedBaseURL, err := url.Parse(baseURL)
+	if err != nil || parsedBaseURL.Host == "" || (parsedBaseURL.Scheme != "http" && parsedBaseURL.Scheme != "https") {
+		return nil, fmt.Errorf("invalid PrusaLink base URL %q", options.BaseURL)
+	}
+	if parsedBaseURL.User != nil {
+		return nil, fmt.Errorf("PrusaLink base URL must not include credentials")
 	}
 
-	transport := &http.Transport{
-		DialContext:           dialer.DialContext,
-		MaxIdleConns:          10,
-		MaxIdleConnsPerHost:   2,
-		IdleConnTimeout:       30 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second, // Timeout for receiving response headers
-		ExpectContinueTimeout: 1 * time.Second,
+	var tlsConfig *tls.Config
+	if len(options.CustomCAPEM) > 0 {
+		rootCAs, err := x509.SystemCertPool()
+		if err != nil {
+			return nil, fmt.Errorf("load system certificate authorities: %w", err)
+		}
+		if rootCAs == nil {
+			rootCAs = x509.NewCertPool()
+		}
+		if !rootCAs.AppendCertsFromPEM(options.CustomCAPEM) {
+			return nil, fmt.Errorf("invalid PrusaLink certificate authority PEM")
+		}
+		tlsConfig = &tls.Config{RootCAs: rootCAs, MinVersion: tls.VersionTLS12}
+	}
+
+	if options.DigestUsername != "" || options.DigestPassword != "" {
+		if options.DigestUsername == "" || options.DigestPassword == "" {
+			return nil, fmt.Errorf("PrusaLink digest authentication requires both username and password")
+		}
+	}
+	transportFactory := func(download bool) http.RoundTripper {
+		dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
+		idleTimeout := 30 * time.Second
+		responseHeaderTimeout := 10 * time.Second
+		if download {
+			idleTimeout = 90 * time.Second
+			responseHeaderTimeout = 30 * time.Second
+		}
+		transport := &http.Transport{
+			DialContext:           dialer.DialContext,
+			MaxIdleConns:          10,
+			MaxIdleConnsPerHost:   2,
+			IdleConnTimeout:       idleTimeout,
+			ResponseHeaderTimeout: responseHeaderTimeout,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+		if tlsConfig != nil {
+			transport.TLSClientConfig = tlsConfig.Clone()
+		}
+		if options.DigestUsername == "" {
+			return transport
+		}
+		return &digest.Transport{
+			Username:  options.DigestUsername,
+			Password:  options.DigestPassword,
+			Transport: transport,
+		}
+	}
+	checkRedirect := func(req *http.Request, _ []*http.Request) error {
+		if !sameHTTPOrigin(parsedBaseURL, req.URL) {
+			return fmt.Errorf("refusing PrusaLink redirect to different origin %s", req.URL.Redacted())
+		}
+		return nil
 	}
 
 	return &PrusaLinkClient{
-		baseURL:             fmt.Sprintf("http://%s", ipAddress),
-		apiKey:              apiKey,
-		fileDownloadTimeout: fileDownloadTimeout,
+		baseURL:             baseURL,
+		apiKey:              options.APIKey,
+		digestConfigured:    options.DigestUsername != "",
+		customCATrust:       len(options.CustomCAPEM) > 0,
+		fileDownloadTimeout: options.FileDownloadTimeout,
 		httpClient: &http.Client{
-			Timeout:   time.Duration(timeout) * time.Second,
-			Transport: transport,
+			Timeout:       time.Duration(options.Timeout) * time.Second,
+			Transport:     transportFactory(false),
+			CheckRedirect: checkRedirect,
 		},
+		transportFactory: transportFactory,
+		checkRedirect:    checkRedirect,
+	}, nil
+}
+
+// GetVersion discovers PrusaLink protocol, firmware, printer, and capability data.
+func (c *PrusaLinkClient) GetVersion() (*PrusaLinkVersion, error) {
+	req, err := http.NewRequest(http.MethodGet, c.baseURL+"/api/version", nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create version request: %w", err)
 	}
+	c.addAPIKey(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get version from PrusaLink: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("PrusaLink API error: %d - %s", resp.StatusCode, string(body))
+	}
+
+	var version PrusaLinkVersion
+	if err := json.NewDecoder(resp.Body).Decode(&version); err != nil {
+		return nil, fmt.Errorf("failed to decode version response: %w", err)
+	}
+	if version.API == "" {
+		return nil, fmt.Errorf("invalid PrusaLink version response: missing api version")
+	}
+	return &version, nil
+}
+
+// GetDiagnostics discovers server versions and reports credential-safe client settings.
+func (c *PrusaLinkClient) GetDiagnostics() (*PrusaLinkDiagnostics, error) {
+	version, err := c.GetVersion()
+	if err != nil {
+		return nil, err
+	}
+	authentication := make([]string, 0, 2)
+	if c.apiKey != "" {
+		authentication = append(authentication, "api-key")
+	}
+	if c.digestConfigured {
+		authentication = append(authentication, "digest")
+	}
+	return &PrusaLinkDiagnostics{
+		BaseURL:        c.baseURL,
+		HTTPS:          strings.HasPrefix(c.baseURL, "https://"),
+		CustomCATrust:  c.customCATrust,
+		Authentication: authentication,
+		API:            version.API,
+		Server:         version.Server,
+		Hostname:       version.Hostname,
+		Firmware:       version.Firmware,
+		Printer:        version.Printer,
+		Capabilities:   version.Capabilities,
+	}, nil
 }
 
 // addAPIKey adds API key authentication to the request
@@ -489,8 +691,8 @@ func (c *PrusaLinkClient) GetGcodeFile(filename string) ([]byte, error) {
 	return body, nil
 }
 
-// GetFilamentUsageFromDownloadWithRetry downloads only as much of the print file as needed
-// to extract the "filament used [g]" line, avoiding full bgcode transfers on flaky links.
+// GetFilamentUsageFromDownloadWithRetry extracts filament usage from ASCII G-code
+// or the structured PrintMetadata block in BGCode.
 func (c *PrusaLinkClient) GetFilamentUsageFromDownloadWithRetry(storagePath string, downloadRef string, fileDownloadTimeout int) (map[int]float64, error) {
 	const maxRetries = 3
 	backoffDelays := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
@@ -504,26 +706,27 @@ func (c *PrusaLinkClient) GetFilamentUsageFromDownloadWithRetry(storagePath stri
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		log.Printf("Downloading G-code file attempt %d/%d: %s", attempt+1, maxRetries, storagePath)
 
-		fileDialer := &net.Dialer{
-			Timeout:   5 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}
-
 		fileClient := &http.Client{
-			Timeout: time.Duration(fileDownloadTimeout) * time.Second,
-			Transport: &http.Transport{
-				DialContext:           fileDialer.DialContext,
-				MaxIdleConns:          10,
-				MaxIdleConnsPerHost:   2,
-				IdleConnTimeout:       90 * time.Second,
-				ResponseHeaderTimeout: 30 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-			},
+			Timeout:       time.Duration(fileDownloadTimeout) * time.Second,
+			Transport:     c.transportFactory(true),
+			CheckRedirect: c.checkRedirect,
 		}
 
 		log.Printf("File download client configured with %v timeout", fileClient.Timeout)
 
 		for _, candidateURL := range candidates {
+			if strings.HasSuffix(strings.ToLower(storagePath), ".bgcode") {
+				filamentUsage, err := c.tryDownloadFilamentUsage(fileClient, candidateURL, false)
+				if err == nil && len(filamentUsage) > 0 {
+					return filamentUsage, nil
+				}
+				lastErr = err
+				if lastErr == nil {
+					lastErr = fmt.Errorf("no filament usage found in BGCode from %s", candidateURL)
+				}
+				continue
+			}
+
 			filamentUsage, err := c.tryDownloadFilamentUsage(fileClient, candidateURL, true)
 			if err == nil && len(filamentUsage) > 0 {
 				log.Printf("Successfully extracted filament usage on attempt %d: %s -> %+v",
@@ -576,21 +779,10 @@ func (c *PrusaLinkClient) GetGcodeFileWithRetry(storagePath string, downloadRef 
 
 		// Create a new client with extended timeout for file downloads
 		// Use the same DNS timeout configuration for consistency
-		fileDialer := &net.Dialer{
-			Timeout:   5 * time.Second, // DNS resolution timeout
-			KeepAlive: 30 * time.Second,
-		}
-
 		fileClient := &http.Client{
-			Timeout: time.Duration(fileDownloadTimeout) * time.Second,
-			Transport: &http.Transport{
-				DialContext:           fileDialer.DialContext,
-				MaxIdleConns:          10,
-				MaxIdleConnsPerHost:   2,
-				IdleConnTimeout:       90 * time.Second,
-				ResponseHeaderTimeout: 30 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-			},
+			Timeout:       time.Duration(fileDownloadTimeout) * time.Second,
+			Transport:     c.transportFactory(true),
+			CheckRedirect: c.checkRedirect,
 		}
 
 		// Add diagnostic logging to verify timeout values
@@ -646,8 +838,11 @@ func (c *PrusaLinkClient) GetGcodeFileWithRetry(storagePath string, downloadRef 
 	return nil, fmt.Errorf("failed to download G-code file after %d attempts: %w", maxRetries, lastErr)
 }
 
-// ParseGcodeFilamentUsage extracts filament usage from .gcode or .bgcode content
+// ParseGcodeFilamentUsage auto-detects ASCII G-code and BGCode content.
 func (c *PrusaLinkClient) ParseGcodeFilamentUsage(gcodeContent []byte) (map[int]float64, error) {
+	if bytes.HasPrefix(gcodeContent, []byte("GCDE")) {
+		return ParseBGCodeFilamentUsage(bytes.NewReader(gcodeContent))
+	}
 	return c.ParseGcodeFilamentUsageFromReader(bytes.NewReader(gcodeContent))
 }
 
@@ -697,6 +892,11 @@ func (c *PrusaLinkClient) buildFileDownloadURLCandidates(storagePath string, dow
 		if !strings.HasPrefix(candidateURL, "http://") && !strings.HasPrefix(candidateURL, "https://") {
 			candidateURL = c.baseURL + "/" + strings.TrimPrefix(candidateURL, "/")
 		}
+		parsedBaseURL, baseErr := url.Parse(c.baseURL)
+		parsedCandidateURL, candidateErr := url.Parse(candidateURL)
+		if baseErr != nil || candidateErr != nil || !sameHTTPOrigin(parsedBaseURL, parsedCandidateURL) {
+			return
+		}
 		if _, exists := seen[candidateURL]; exists {
 			return
 		}
@@ -713,6 +913,13 @@ func (c *PrusaLinkClient) buildFileDownloadURLCandidates(storagePath string, dow
 	addCandidate("/" + strings.TrimPrefix(strings.TrimSpace(storagePath), "/"))
 
 	return candidates
+}
+
+func sameHTTPOrigin(left, right *url.URL) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	return strings.EqualFold(left.Scheme, right.Scheme) && strings.EqualFold(left.Host, right.Host)
 }
 
 func (c *PrusaLinkClient) buildRawFileDownloadURL(storagePath string) (string, error) {
@@ -796,13 +1003,18 @@ func (c *PrusaLinkClient) tryDownloadFilamentUsage(fileClient *http.Client, cand
 		return nil, fmt.Errorf("PrusaLink API error: %d - %s", resp.StatusCode, string(body))
 	}
 
-	return c.ParseGcodeFilamentUsageFromReader(resp.Body)
+	buffered := bufio.NewReader(resp.Body)
+	magic, peekErr := buffered.Peek(4)
+	if peekErr == nil && bytes.Equal(magic, []byte("GCDE")) {
+		return ParseBGCodeFilamentUsage(buffered)
+	}
+	return c.ParseGcodeFilamentUsageFromReader(buffered)
 }
 
 func parseFilamentUsageFromContent(content string) map[int]float64 {
 	filamentUsage := make(map[int]float64)
 
-	// Parse both .gcode and .bgcode formats.
+	// Parse ASCII G-code. BGCode is decoded through ParseBGCodeFilamentUsage.
 	// Examples:
 	//   "filament used [g]=29.19"
 	//   "; filament used [g] = 1.23, 4.56"

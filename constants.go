@@ -3,8 +3,14 @@ package main
 // Printer states
 const (
 	StateIdle          = "IDLE"
+	StateReady         = "READY"
+	StateBusy          = "BUSY"
 	StatePrinting      = "PRINTING"
+	StatePaused        = "PAUSED"
+	StateAttention     = "ATTENTION"
 	StateFinished      = "FINISHED"
+	StateStopped       = "STOPPED"
+	StateError         = "ERROR"
 	StateOffline       = "offline"
 	StateNotConfigured = "not_configured"
 )
@@ -20,18 +26,19 @@ const (
 
 // Database configuration keys
 const (
-	ConfigKeyPrinterIPs                   = "printer_ips"
-	ConfigKeyAPIKey                       = "prusalink_api_key"
-	ConfigKeySpoolmanURL                  = "spoolman_url"
-	ConfigKeyPollInterval                 = "poll_interval"
-	ConfigKeyLocationSyncInterval         = "location_sync_interval"
-	ConfigKeyWebPort                      = "web_port"
-	ConfigKeyPrusaLinkTimeout             = "prusalink_timeout"
-	ConfigKeyPrusaLinkFileDownloadTimeout = "prusalink_file_download_timeout"
-	ConfigKeySpoolmanTimeout              = "spoolman_timeout"
-	ConfigKeySpoolmanUsername             = "spoolman_username"
-	ConfigKeySpoolmanPassword             = "spoolman_password"
-	ConfigKeyAutoAssignPreviousSpoolEnabled = "auto_assign_previous_spool_enabled"
+	ConfigKeyPrinterIPs                      = "printer_ips"
+	ConfigKeyAPIKey                          = "prusalink_api_key"
+	ConfigKeySpoolmanURL                     = "spoolman_url"
+	ConfigKeyPollInterval                    = "poll_interval"
+	ConfigKeyLocationSyncInterval            = "location_sync_interval"
+	ConfigKeyWebPort                         = "web_port"
+	ConfigKeyPrusaLinkTimeout                = "prusalink_timeout"
+	ConfigKeyPrusaLinkFileDownloadTimeout    = "prusalink_file_download_timeout"
+	ConfigKeySpoolmanTimeout                 = "spoolman_timeout"
+	ConfigKeySpoolmanUsername                = "spoolman_username"
+	ConfigKeySpoolmanPassword                = "spoolman_password"
+	ConfigKeyConsumptionAuthority            = "consumption_authority"
+	ConfigKeyAutoAssignPreviousSpoolEnabled  = "auto_assign_previous_spool_enabled"
 	ConfigKeyAutoAssignPreviousSpoolLocation = "auto_assign_previous_spool_location"
 )
 

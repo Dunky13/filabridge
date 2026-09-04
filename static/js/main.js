@@ -132,6 +132,15 @@ function loadConfiguration() {
                         <input type="number" id="poll_interval" value="${config.poll_interval || '30'}" min="10" max="300">
                         <small>How often to check printer status</small>
                     </div>
+                    <div class="form-group">
+                        <label><strong>Consumption Authority:</strong></label>
+                        <select id="consumption_authority">
+                            <option value="spoolman-led" ${config.consumption_authority === 'spoolman-led' ? 'selected' : ''}>Spoolman-led (automatic job debit)</option>
+                            <option value="tag-led" ${config.consumption_authority === 'tag-led' ? 'selected' : ''}>OpenPrintTag-led (observe jobs only)</option>
+                            <option value="observed-only" ${config.consumption_authority === 'observed-only' ? 'selected' : ''}>Observed only (no automatic debit)</option>
+                        </select>
+                        <small>Exactly one system may author consumption; this prevents double deductions.</small>
+                    </div>
                     <div style="margin-top: 20px; text-align: center;">
                         <button class="btn" onclick="saveConfiguration()">💾 Save Configuration</button>
                     </div>
@@ -149,7 +158,8 @@ function saveConfiguration() {
         spoolman_url: document.getElementById('spoolman_url').value,
         spoolman_username: document.getElementById('spoolman_username').value,
         spoolman_password: document.getElementById('spoolman_password').value,
-        poll_interval: document.getElementById('poll_interval').value
+        poll_interval: document.getElementById('poll_interval').value,
+        consumption_authority: document.getElementById('consumption_authority').value
     };
     
     fetch('/api/config', {

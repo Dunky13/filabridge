@@ -155,17 +155,29 @@ func (ws *WebServer) setupRoutes() {
 		api.GET("/available_spools", ws.availableSpoolsHandler)
 		api.GET("/spoolman/test", ws.testSpoolmanConnectionHandler)
 		api.GET("/spoolman/debug", ws.debugSpoolmanHandler)
+		api.GET("/spoolman/capabilities", ws.spoolmanCapabilitiesHandler)
+		api.GET("/spoolman/tags/:uid", ws.lookupSpoolmanTagHandler)
+		api.POST("/spools/:id/tags", ws.associateSpoolmanTagHandler)
+		api.GET("/spools/:id/consumption-authority", ws.getSpoolConsumptionAuthorityHandler)
+		api.PUT("/spools/:id/consumption-authority", ws.updateSpoolConsumptionAuthorityHandler)
 		api.POST("/test/print_complete", ws.testPrintCompleteHandler)
 		api.GET("/config", ws.getConfigHandler)
 		api.POST("/config", ws.updateConfigHandler)
 		api.GET("/config/auto-assign-previous-spool", ws.getAutoAssignPreviousSpoolHandler)
 		api.PUT("/config/auto-assign-previous-spool", ws.updateAutoAssignPreviousSpoolHandler)
 		api.GET("/printers", ws.getPrintersHandler)
+		api.GET("/printer-presets", ws.printerPresetsHandler)
 		api.POST("/printers", ws.addPrinterHandler)
 		api.PUT("/printers/:id", ws.updatePrinterHandler)
 		api.DELETE("/printers/:id", ws.deletePrinterHandler)
 		api.GET("/printers/:id/toolheads", ws.getToolheadNamesHandler)
 		api.PUT("/printers/:id/toolheads/:toolhead_id", ws.updateToolheadNameHandler)
+		api.GET("/printers/:id/tool-routes", ws.getLogicalToolRoutesHandler)
+		api.PUT("/printers/:id/tool-routes/:logical_tool_id", ws.updateLogicalToolRouteHandler)
+		api.DELETE("/printers/:id/tool-routes/:logical_tool_id", ws.resetLogicalToolRouteHandler)
+		api.GET("/printers/:id/prusalink-diagnostics", ws.prusaLinkDiagnosticsHandler)
+		api.GET("/printers/:id/job-reconciliation", ws.getJobReconciliationHandler)
+		api.POST("/printers/:id/job-reconciliation/resolve", ws.resolveJobReconciliationHandler)
 		api.POST("/detect_printer", ws.detectPrinterHandler)
 		api.GET("/print-errors", ws.getPrintErrorsHandler)
 		api.POST("/print-errors/:id/acknowledge", ws.acknowledgePrintErrorHandler)
@@ -639,6 +651,16 @@ func validateAddress(address string) error {
 	if address == "" {
 		return fmt.Errorf("address cannot be empty")
 	}
+	if strings.Contains(address, "://") {
+		parsed, err := neturl.Parse(address)
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return fmt.Errorf("address must be an HTTP or HTTPS PrusaLink URL")
+		}
+		if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+			return fmt.Errorf("PrusaLink URL must not contain credentials, query, fragment, or path")
+		}
+		return nil
+	}
 	// Basic validation - check for reasonable length (hostnames can be longer than IPs)
 	// Minimum: 1 character (e.g., "a"), Maximum: 253 characters (RFC 1035)
 	if len(address) < 1 || len(address) > 253 {
@@ -774,6 +796,12 @@ func (ws *WebServer) updateConfigHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
 		return
 	}
+	if value, exists := config[ConfigKeyConsumptionAuthority]; exists {
+		if _, err := ParseConsumptionAuthority(value); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
 
 	// Update each config value
 	for key, value := range config {
@@ -857,11 +885,15 @@ func (ws *WebServer) getPrintersHandler(c *gin.Context) {
 	result := make(map[string]interface{})
 	for printerID, printerConfig := range printerConfigs {
 		printerData := map[string]interface{}{
-			"name":       printerConfig.Name,
-			"model":      printerConfig.Model,
-			"ip_address": printerConfig.IPAddress,
-			"api_key":    printerConfig.APIKey,
-			"toolheads":  printerConfig.Toolheads,
+			"name":                           printerConfig.Name,
+			"preset_id":                      resolvedPrinterPresetID(printerConfig.Model, printerConfig.Toolheads),
+			"model":                          printerConfig.Model,
+			"ip_address":                     printerConfig.IPAddress,
+			"api_key_configured":             printerConfig.APIKey != "",
+			"prusalink_username":             printerConfig.PrusaLinkUsername,
+			"prusalink_password_configured":  printerConfig.PrusaLinkPassword != "",
+			"prusalink_custom_ca_configured": printerConfig.PrusaLinkCustomCAPEM != "",
+			"toolheads":                      printerConfig.Toolheads,
 		}
 
 		// Get toolhead names for this printer
@@ -885,6 +917,145 @@ func (ws *WebServer) getPrintersHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"printers": result})
 }
 
+// printerPresetsHandler returns model/toolhead combinations supported by the
+// settings UI. The custom ID keeps manual and third-party configs available.
+func (ws *WebServer) printerPresetsHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"presets":          PrinterPresets(),
+		"custom_preset_id": CustomPrinterPresetID,
+	})
+}
+
+func (ws *WebServer) getLogicalToolRoutesHandler(c *gin.Context) {
+	printerConfig, ok := ws.printerConfigByID(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "printer not found"})
+		return
+	}
+	routes, err := ws.bridge.GetLogicalToolRoutes(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	for logicalToolID := 0; logicalToolID < printerConfig.Toolheads; logicalToolID++ {
+		if _, exists := routes[logicalToolID]; !exists {
+			routes[logicalToolID] = logicalToolID
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"routes": routes})
+}
+
+func (ws *WebServer) updateLogicalToolRouteHandler(c *gin.Context) {
+	printerConfig, ok := ws.printerConfigByID(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "printer not found"})
+		return
+	}
+	logicalToolID, err := strconv.Atoi(c.Param("logical_tool_id"))
+	if err != nil || logicalToolID < 0 || logicalToolID >= printerConfig.Toolheads {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "logical tool ID is outside printer range"})
+		return
+	}
+	var request struct {
+		PhysicalToolheadID int `json:"physical_toolhead_id"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON payload"})
+		return
+	}
+	if request.PhysicalToolheadID < 0 || request.PhysicalToolheadID >= printerConfig.Toolheads {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "physical toolhead ID is outside printer range"})
+		return
+	}
+	if err := ws.bridge.SetLogicalToolRoute(c.Param("id"), logicalToolID, request.PhysicalToolheadID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"logical_tool_id": logicalToolID, "physical_toolhead_id": request.PhysicalToolheadID})
+}
+
+func (ws *WebServer) resetLogicalToolRouteHandler(c *gin.Context) {
+	printerConfig, ok := ws.printerConfigByID(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "printer not found"})
+		return
+	}
+	logicalToolID, err := strconv.Atoi(c.Param("logical_tool_id"))
+	if err != nil || logicalToolID < 0 || logicalToolID >= printerConfig.Toolheads {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "logical tool ID is outside printer range"})
+		return
+	}
+	if err := ws.bridge.ResetLogicalToolRoute(c.Param("id"), logicalToolID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (ws *WebServer) printerConfigByID(printerID string) (PrinterConfig, bool) {
+	configs, err := ws.bridge.GetAllPrinterConfigs()
+	if err != nil {
+		return PrinterConfig{}, false
+	}
+	config, ok := configs[printerID]
+	return config, ok
+}
+
+func (ws *WebServer) prusaLinkDiagnosticsHandler(c *gin.Context) {
+	printerConfig, ok := ws.printerConfigByID(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "printer not found"})
+		return
+	}
+	client, err := newConfiguredPrusaLinkClient(printerConfig, ws.bridge.config.PrusaLinkTimeout, ws.bridge.config.PrusaLinkFileDownloadTimeout)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	diagnostics, err := client.GetDiagnostics()
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, diagnostics)
+}
+
+func (ws *WebServer) getJobReconciliationHandler(c *gin.Context) {
+	checkpoint, err := ws.bridge.loadPrinterJobCheckpoint(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if checkpoint == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "printer has no job checkpoint"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"job_name":          checkpoint.JobName,
+		"source_path":       checkpoint.SourcePath,
+		"last_state":        checkpoint.LastState,
+		"progress":          checkpoint.Progress,
+		"accounting_status": checkpoint.AccountingStatus,
+		"terminal_state":    checkpoint.TerminalState,
+		"started_at":        checkpoint.StartedAt,
+	})
+}
+
+func (ws *WebServer) resolveJobReconciliationHandler(c *gin.Context) {
+	var request struct {
+		Outcome string `json:"outcome" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "outcome is required"})
+		return
+	}
+	if err := ws.bridge.resolvePrinterJobCheckpoint(c.Param("id"), request.Outcome); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"resolved": true, "outcome": strings.ToUpper(strings.TrimSpace(request.Outcome))})
+}
+
 // addPrinterHandler adds a new printer configuration
 func (ws *WebServer) addPrinterHandler(c *gin.Context) {
 	// Serialize printer operations to prevent race conditions
@@ -893,6 +1064,11 @@ func (ws *WebServer) addPrinterHandler(c *gin.Context) {
 
 	var printerConfig PrinterConfig
 	if err := c.ShouldBindJSON(&printerConfig); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	printerConfig, err := ApplyPrinterPreset(printerConfig)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -935,8 +1111,59 @@ func (ws *WebServer) updatePrinterHandler(c *gin.Context) {
 
 	printerID := c.Param("id")
 
-	var printerConfig PrinterConfig
-	if err := c.ShouldBindJSON(&printerConfig); err != nil {
+	var request struct {
+		PrinterConfig
+		ClearAPIKey               bool `json:"clear_api_key"`
+		ClearPrusaLinkCredentials bool `json:"clear_prusalink_credentials"`
+		ClearPrusaLinkPassword    bool `json:"clear_prusalink_password"`
+		ClearPrusaLinkCustomCAPEM bool `json:"clear_prusalink_custom_ca_pem"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	printerConfig := request.PrinterConfig
+	existingConfig, exists := ws.printerConfigByID(printerID)
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Printer not found"})
+		return
+	}
+	originChanged := strings.TrimRight(strings.TrimSpace(printerConfig.IPAddress), "/") != strings.TrimRight(strings.TrimSpace(existingConfig.IPAddress), "/")
+	if originChanged {
+		if existingConfig.APIKey != "" && printerConfig.APIKey == "" && !request.ClearAPIKey {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "changing the PrusaLink address requires re-entering or explicitly clearing the API key"})
+			return
+		}
+		if (existingConfig.PrusaLinkUsername != "" || existingConfig.PrusaLinkPassword != "") && printerConfig.PrusaLinkPassword == "" && !request.ClearPrusaLinkCredentials {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "changing the PrusaLink address requires re-entering or explicitly clearing Digest credentials"})
+			return
+		}
+		if existingConfig.PrusaLinkCustomCAPEM != "" && printerConfig.PrusaLinkCustomCAPEM == "" && !request.ClearPrusaLinkCustomCAPEM {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "changing the PrusaLink address requires re-entering or explicitly clearing the custom CA"})
+			return
+		}
+	}
+	// Connection secrets are write-only. Empty values retain the stored value;
+	// clients replace a secret by sending a non-empty value.
+	if printerConfig.APIKey == "" && !request.ClearAPIKey {
+		printerConfig.APIKey = existingConfig.APIKey
+	}
+	if request.ClearPrusaLinkCredentials {
+		printerConfig.PrusaLinkUsername = ""
+		printerConfig.PrusaLinkPassword = ""
+	} else {
+		if printerConfig.PrusaLinkUsername == "" {
+			printerConfig.PrusaLinkUsername = existingConfig.PrusaLinkUsername
+		}
+		if printerConfig.PrusaLinkPassword == "" && !request.ClearPrusaLinkPassword {
+			printerConfig.PrusaLinkPassword = existingConfig.PrusaLinkPassword
+		}
+	}
+	if printerConfig.PrusaLinkCustomCAPEM == "" && !request.ClearPrusaLinkCustomCAPEM {
+		printerConfig.PrusaLinkCustomCAPEM = existingConfig.PrusaLinkCustomCAPEM
+	}
+	printerConfig, err := ApplyPrinterPreset(printerConfig)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -958,7 +1185,11 @@ func (ws *WebServer) updatePrinterHandler(c *gin.Context) {
 		log.Printf("🔍 [Auto-Detection] Detecting model for printer %s (IP: %s)", printerID, printerConfig.IPAddress)
 
 		// Create PrusaLink client for detection
-		client := NewPrusaLinkClient(printerConfig.IPAddress, printerConfig.APIKey, 10, 60) // Use default timeouts for detection
+		client, clientErr := newConfiguredPrusaLinkClient(printerConfig, 10, 60)
+		if clientErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": clientErr.Error()})
+			return
+		}
 
 		// Try to get printer info
 		printerInfo, err := client.GetPrinterInfo()
@@ -1106,32 +1337,7 @@ func (ws *WebServer) updateToolheadNameHandler(c *gin.Context) {
 
 // detectPrinterModel detects printer model from hostname
 func detectPrinterModel(hostname string) string {
-	model := ModelUnknown
-	hostnameLower := strings.ToLower(hostname)
-	hostnameLower = strings.TrimSpace(hostnameLower) // Clean up any whitespace
-
-	log.Printf("🔍 [Detection] Checking hostname '%s' against patterns:", hostnameLower)
-
-	if strings.Contains(hostnameLower, ModelCorePattern) {
-		model = ModelCoreOne
-		log.Printf("✅ [Detection] Matched pattern '%s' -> %s", ModelCorePattern, model)
-	} else if strings.Contains(hostnameLower, ModelXLPattern) {
-		model = ModelXL
-		log.Printf("✅ [Detection] Matched pattern '%s' -> %s", ModelXLPattern, model)
-	} else if strings.Contains(hostnameLower, ModelMK4Pattern) {
-		model = ModelMK4
-		log.Printf("✅ [Detection] Matched pattern '%s' -> %s", ModelMK4Pattern, model)
-	} else if strings.Contains(hostnameLower, ModelMK3Pattern) {
-		model = ModelMK35
-		log.Printf("✅ [Detection] Matched pattern '%s' -> %s", ModelMK3Pattern, model)
-	} else if strings.Contains(hostnameLower, ModelMiniPattern) {
-		model = ModelMiniPlus
-		log.Printf("✅ [Detection] Matched pattern '%s' -> %s", ModelMiniPattern, model)
-	} else {
-		log.Printf("❌ [Detection] No pattern matched for hostname '%s'. Available patterns: %s, %s, %s, %s, %s",
-			hostnameLower, ModelCorePattern, ModelXLPattern, ModelMK4Pattern, ModelMK3Pattern, ModelMiniPattern)
-	}
-
+	model := DetectPrinterModel(hostname)
 	log.Printf("🎯 [Detection] Final result: hostname='%s' -> model='%s'", hostname, model)
 	return model
 }
@@ -1139,8 +1345,11 @@ func detectPrinterModel(hostname string) string {
 // detectPrinterHandler detects printer model from PrusaLink API
 func (ws *WebServer) detectPrinterHandler(c *gin.Context) {
 	var req struct {
-		IPAddress string `json:"ip_address" binding:"required"`
-		APIKey    string `json:"api_key" binding:"required"`
+		IPAddress            string `json:"ip_address" binding:"required"`
+		APIKey               string `json:"api_key"`
+		PrusaLinkUsername    string `json:"prusalink_username"`
+		PrusaLinkPassword    string `json:"prusalink_password"`
+		PrusaLinkCustomCAPEM string `json:"prusalink_custom_ca_pem"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1157,7 +1366,17 @@ func (ws *WebServer) detectPrinterHandler(c *gin.Context) {
 	log.Printf("🔍 [Detection] Starting printer model detection for IP: %s", req.IPAddress)
 
 	// Create PrusaLink client
-	client := NewPrusaLinkClient(req.IPAddress, req.APIKey, 10, 60) // Use default timeouts for detection
+	client, err := newConfiguredPrusaLinkClient(PrinterConfig{
+		IPAddress:            req.IPAddress,
+		APIKey:               req.APIKey,
+		PrusaLinkUsername:    req.PrusaLinkUsername,
+		PrusaLinkPassword:    req.PrusaLinkPassword,
+		PrusaLinkCustomCAPEM: req.PrusaLinkCustomCAPEM,
+	}, 10, 60)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	// Try to get printer info, but don't fail if it times out
 	printerInfo, err := client.GetPrinterInfo()
@@ -1195,6 +1414,96 @@ func (ws *WebServer) testSpoolmanConnectionHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Connection successful", "connected": true})
+}
+
+func (ws *WebServer) spoolmanCapabilitiesHandler(c *gin.Context) {
+	capabilities, err := ws.bridge.spoolman.DetectCapabilities()
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, capabilities)
+}
+
+func (ws *WebServer) lookupSpoolmanTagHandler(c *gin.Context) {
+	uid := strings.TrimSpace(c.Param("uid"))
+	if uid == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tag UID is required"})
+		return
+	}
+	spool, err := ws.bridge.spoolman.LookupSpoolByTagUID(uid)
+	if errors.Is(err, ErrSpoolmanTagAPIUnsupported) {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": err.Error(), "supported": false})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"supported": true, "spool": spool})
+}
+
+func (ws *WebServer) associateSpoolmanTagHandler(c *gin.Context) {
+	spoolID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || spoolID < 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "valid spool ID is required"})
+		return
+	}
+	var request struct {
+		UID    string `json:"uid" binding:"required"`
+		Format string `json:"format"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil || strings.TrimSpace(request.UID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tag UID is required"})
+		return
+	}
+	if request.Format == "" {
+		request.Format = "openprinttag"
+	}
+	tag, err := ws.bridge.spoolman.AssociateTagWithSpool(spoolID, request.UID, request.Format)
+	if errors.Is(err, ErrSpoolmanTagAPIUnsupported) {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": err.Error(), "supported": false})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"supported": true, "tag": tag})
+}
+
+func (ws *WebServer) getSpoolConsumptionAuthorityHandler(c *gin.Context) {
+	spoolID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || spoolID < 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "valid spool ID is required"})
+		return
+	}
+	authority, err := ws.bridge.GetSpoolConsumptionAuthority(spoolID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"spool_id": spoolID, "authority": authority})
+}
+
+func (ws *WebServer) updateSpoolConsumptionAuthorityHandler(c *gin.Context) {
+	spoolID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || spoolID < 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "valid spool ID is required"})
+		return
+	}
+	var request struct {
+		Authority ConsumptionAuthority `json:"authority" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "authority is required"})
+		return
+	}
+	if err := ws.bridge.SetSpoolConsumptionAuthority(spoolID, request.Authority); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"spool_id": spoolID, "authority": request.Authority})
 }
 
 // debugSpoolmanHandler provides detailed debug information about Spoolman data

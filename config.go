@@ -10,11 +10,15 @@ import (
 
 // PrinterConfig represents configuration for a single printer
 type PrinterConfig struct {
-	Name      string `json:"name"`
-	Model     string `json:"model"`
-	IPAddress string `json:"ip_address"`
-	APIKey    string `json:"api_key,omitempty"`
-	Toolheads int    `json:"toolheads"`
+	Name                 string `json:"name"`
+	PresetID             string `json:"preset_id,omitempty"`
+	Model                string `json:"model"`
+	IPAddress            string `json:"ip_address"`
+	APIKey               string `json:"api_key,omitempty"`
+	PrusaLinkUsername    string `json:"prusalink_username,omitempty"`
+	PrusaLinkPassword    string `json:"prusalink_password,omitempty"`
+	PrusaLinkCustomCAPEM string `json:"prusalink_custom_ca_pem,omitempty"`
+	Toolheads            int    `json:"toolheads"`
 }
 
 // FilamentSpool represents a filament spool from Spoolman
@@ -41,6 +45,7 @@ type Config struct {
 	PrusaLinkTimeout             int
 	PrusaLinkFileDownloadTimeout int
 	SpoolmanTimeout              int
+	ConsumptionAuthority         ConsumptionAuthority
 	Printers                     map[string]PrinterConfig // Key is printer ID, value is printer config
 }
 
@@ -90,6 +95,11 @@ func LoadConfig(bridge *FilamentBridge) (*Config, error) {
 		}
 	}
 
+	consumptionAuthority, err := ParseConsumptionAuthority(configValues[ConfigKeyConsumptionAuthority])
+	if err != nil {
+		return nil, fmt.Errorf("invalid consumption authority: %w", err)
+	}
+
 	config := &Config{
 		SpoolmanURL:                  configValues[ConfigKeySpoolmanURL],
 		SpoolmanUsername:             configValues[ConfigKeySpoolmanUsername],
@@ -101,6 +111,7 @@ func LoadConfig(bridge *FilamentBridge) (*Config, error) {
 		PrusaLinkTimeout:             prusaLinkTimeout,
 		PrusaLinkFileDownloadTimeout: prusaLinkFileDownloadTimeout,
 		SpoolmanTimeout:              spoolmanTimeout,
+		ConsumptionAuthority:         consumptionAuthority,
 		Printers:                     make(map[string]PrinterConfig),
 	}
 
@@ -125,11 +136,15 @@ func LoadConfig(bridge *FilamentBridge) (*Config, error) {
 		// This prevents race conditions and timeouts during config loading
 		// Live printer status will be handled by the monitoring cycle
 		config.Printers[printerID] = PrinterConfig{
-			Name:      printerConfig.Name,
-			Model:     printerConfig.Model,
-			IPAddress: printerConfig.IPAddress,
-			APIKey:    printerConfig.APIKey,
-			Toolheads: printerConfig.Toolheads,
+			Name:                 printerConfig.Name,
+			PresetID:             resolvedPrinterPresetID(printerConfig.Model, printerConfig.Toolheads),
+			Model:                printerConfig.Model,
+			IPAddress:            printerConfig.IPAddress,
+			APIKey:               printerConfig.APIKey,
+			PrusaLinkUsername:    printerConfig.PrusaLinkUsername,
+			PrusaLinkPassword:    printerConfig.PrusaLinkPassword,
+			PrusaLinkCustomCAPEM: printerConfig.PrusaLinkCustomCAPEM,
+			Toolheads:            printerConfig.Toolheads,
 		}
 	}
 

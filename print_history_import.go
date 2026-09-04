@@ -146,6 +146,10 @@ func (b *FilamentBridge) ensurePrintHistoryImportSchema() error {
 			column: "source_path",
 			query:  "ALTER TABLE print_history ADD COLUMN source_path TEXT",
 		},
+		{
+			column: "accounting_key",
+			query:  "ALTER TABLE print_history ADD COLUMN accounting_key TEXT",
+		},
 	}
 
 	for _, statement := range alterStatements {
@@ -164,6 +168,9 @@ func (b *FilamentBridge) ensurePrintHistoryImportSchema() error {
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_print_history_import_job
 		ON print_history (import_source, external_printer_uuid, external_job_id, toolhead_id)
 		WHERE external_printer_uuid IS NOT NULL AND external_printer_uuid != '' AND external_job_id IS NOT NULL AND external_job_id != ''`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_print_history_accounting_key
+		ON print_history (accounting_key)
+		WHERE accounting_key IS NOT NULL AND accounting_key != ''`,
 	}
 
 	for _, statement := range indexStatements {
