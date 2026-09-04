@@ -1,6 +1,6 @@
 services:
   filabridge:
-    image: ghcr.io/needo37/filabridge:latest
+    image: ghcr.io/dunky13/filabridge:latest
     ports:
       - "5000:5000"
     volumes:

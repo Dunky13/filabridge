@@ -2,7 +2,7 @@
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Go Version](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)](https://go.dev/)
-[![GitHub release](https://img.shields.io/github/v/release/needo37/filabridge)](https://github.com/needo37/filabridge/releases)
+[![GitHub release](https://img.shields.io/github/v/release/Dunky13/filabridge)](https://github.com/Dunky13/filabridge/releases)
 
 Manual release and container workflow runs publish the requested immutable
 version tag. The rolling `latest` tag is updated only when that version is the
@@ -68,16 +68,16 @@ No more manual updates or guesswork about remaining filament!
 
 ## Screenshots
 
-![FilaBridge Dashboard](https://github.com/needo37/filabridge/blob/main/screenshots/dashboard.png?raw=true)
+![FilaBridge Dashboard](https://github.com/Dunky13/filabridge/blob/main/screenshots/dashboard.png?raw=true)
 _FilaBridge main dashboard showing printer status and toolhead mappings_
 
-![Spool Tags Management](https://github.com/needo37/filabridge/blob/main/screenshots/spool_tags.png?raw=true)
+![Spool Tags Management](https://github.com/Dunky13/filabridge/blob/main/screenshots/spool_tags.png?raw=true)
 _NFC Management interface for generating QR codes for individual spools_
 
-![Filament Tags Management](https://github.com/needo37/filabridge/blob/main/screenshots/filament_tags.png?raw=true)
+![Filament Tags Management](https://github.com/Dunky13/filabridge/blob/main/screenshots/filament_tags.png?raw=true)
 _Filament type QR code generation for new unopened spools_
 
-![Location Tags Management](https://github.com/needo37/filabridge/blob/main/screenshots/location_tags.png?raw=true)
+![Location Tags Management](https://github.com/Dunky13/filabridge/blob/main/screenshots/location_tags.png?raw=true)
 _Location management interface for creating printer toolhead and storage location QR codes_
 
 ## Prerequisites
@@ -106,7 +106,7 @@ _Location management interface for creating printer toolhead and storage locatio
      -e FILABRIDGE_WEB_USERNAME=admin \
      -e FILABRIDGE_WEB_PASSWORD='replace-with-a-long-random-password' \
      -v filabridge-data:/app/data \
-     ghcr.io/needo37/filabridge:latest
+     ghcr.io/dunky13/filabridge:latest
    ```
 
 3. **Configure**: Open `http://localhost:5000` and click "⚙️ Configuration"
@@ -114,7 +114,7 @@ _Location management interface for creating printer toolhead and storage locatio
 **Using docker-compose (recommended for full stack):**
 
 ```bash
-git clone https://github.com/needo37/filabridge.git
+git clone https://github.com/Dunky13/filabridge.git
 cd filabridge
 export FILABRIDGE_WEB_USERNAME=admin
 export FILABRIDGE_WEB_PASSWORD='replace-with-a-long-random-password'
@@ -136,7 +136,7 @@ non-root image.
 
 ### Option 2: Pre-built Binary
 
-1. **Download the latest release** for your platform from the [Releases page](https://github.com/needo37/filabridge/releases)
+1. **Download the latest release** for your platform from the [Releases page](https://github.com/Dunky13/filabridge/releases)
    - Linux (amd64, arm64)
    - macOS (amd64/Intel, arm64/Apple Silicon)
    - Windows (amd64)
@@ -166,7 +166,7 @@ non-root image.
 1. **Clone and build**:
 
    ```bash
-   git clone https://github.com/needo37/filabridge.git
+   git clone https://github.com/Dunky13/filabridge.git
    cd filabridge
    go mod download
    go build -o filabridge .

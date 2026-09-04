@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/needo37/filabridge/testdata/compatibility/golden-fixture.schema.json",
+  "$id": "https://github.com/Dunky13/filabridge/testdata/compatibility/golden-fixture.schema.json",
   "title": "FilaBridge real upstream compatibility evidence",
   "type": "object",
   "additionalProperties": false,
