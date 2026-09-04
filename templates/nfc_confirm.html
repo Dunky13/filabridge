@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Confirm NFC Scan - FilaBridge</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); margin: 0; padding: 20px; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .container { background: white; border-radius: 12px; padding: 40px; box-shadow: 0 20px 40px rgba(0,0,0,0.1); text-align: center; max-width: 500px; width: 100%; }
+        .scan-icon { font-size: 64px; margin-bottom: 20px; }
+        h1 { color: #2c3e50; margin-bottom: 20px; font-size: 28px; }
+        .scan-description { color: #495057; font-size: 18px; margin-bottom: 30px; overflow-wrap: anywhere; }
+        .actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+        button, a { border: none; padding: 12px 24px; border-radius: 6px; font-size: 16px; cursor: pointer; text-decoration: none; }
+        button { background: #27ae60; color: white; }
+        a { background: #e9ecef; color: #2c3e50; }
+    </style>
+</head>
+<body>
+    <main class="container">
+        <div class="scan-icon" aria-hidden="true">📱</div>
+        <h1>Confirm NFC scan</h1>
+        <p class="scan-description">{{.Description}}</p>
+        <form method="post" action="/api/nfc/assign">
+            {{if .SpoolID}}<input type="hidden" name="spool" value="{{.SpoolID}}">{{end}}
+            {{if .Location}}<input type="hidden" name="location" value="{{.Location}}">{{end}}
+            <div class="actions">
+                <button type="submit">Confirm NFC scan</button>
+                <a href="/">Cancel</a>
+            </div>
+        </form>
+    </main>
+</body>
+</html>

@@ -48,6 +48,29 @@ async function loadNfcData() {
     await loadLocationTags();
 }
 
+function normalizedNfcColor(value) {
+    const color = String(value || '').replace(/^#/, '');
+    return /^(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(color)
+        ? `#${color}`
+        : '#ccc';
+}
+
+function appendNfcListCopy(item, name, details) {
+    const info = document.createElement('div');
+    info.className = 'item-info';
+    const nameElement = document.createElement('div');
+    nameElement.className = 'item-name';
+    nameElement.textContent = name;
+    info.appendChild(nameElement);
+    if (details != null) {
+        const detailsElement = document.createElement('div');
+        detailsElement.className = 'item-details';
+        detailsElement.textContent = details;
+        info.appendChild(detailsElement);
+    }
+    item.appendChild(info);
+}
+
 async function loadSpoolTags() {
     try {
         console.log('Loading spool tags...');
@@ -60,11 +83,13 @@ async function loadSpoolTags() {
         console.log('Spool URLs:', spoolUrls);
         
         if (spoolUrls.length === 0) {
-            container.innerHTML = '<p>No spools available</p>';
+            const message = document.createElement('p');
+            message.textContent = 'No spools available';
+            container.replaceChildren(message);
             return;
         }
         
-        container.innerHTML = '';
+        container.replaceChildren();
         
         spoolUrls.forEach(url => {
             const item = document.createElement('div');
@@ -74,14 +99,18 @@ async function loadSpoolTags() {
             item.dataset.url = url.url;
             item.dataset.qr = url.qr_code_base64;
             
-            const colorHex = url.color_hex || '#ccc';
-            item.innerHTML = `
-                <div class="color-swatch" style="background-color: ${colorHex}"></div>
-                <div class="item-info">
-                    <div class="item-name">[${url.spool_id}] ${url.spool_name}</div>
-                    <div class="item-details">${url.material} - ${url.brand}${url.remaining_weight != null ? ` - ${Math.round(url.remaining_weight)}g remaining` : ''}</div>
-                </div>
-            `;
+            const colorSwatch = document.createElement('div');
+            colorSwatch.className = 'color-swatch';
+            colorSwatch.style.backgroundColor = normalizedNfcColor(url.color_hex);
+            item.appendChild(colorSwatch);
+            const remaining = url.remaining_weight != null && Number.isFinite(Number(url.remaining_weight))
+                ? ` - ${Math.round(Number(url.remaining_weight))}g remaining`
+                : '';
+            appendNfcListCopy(
+                item,
+                `[${String(url.spool_id ?? '')}] ${String(url.spool_name || '')}`,
+                `${String(url.material || '')} - ${String(url.brand || '')}${remaining}`,
+            );
             
             // Add click handler
             item.addEventListener('click', () => {
@@ -101,7 +130,9 @@ async function loadSpoolTags() {
         
     } catch (error) {
         console.error('Error loading spool tags:', error);
-        document.getElementById('spool-list-container').innerHTML = '<p>Error loading spools</p>';
+        const message = document.createElement('p');
+        message.textContent = 'Error loading spools';
+        document.getElementById('spool-list-container').replaceChildren(message);
     }
 }
 
@@ -117,11 +148,13 @@ async function loadFilamentTags() {
         console.log('Filament URLs:', filamentUrls);
         
         if (filamentUrls.length === 0) {
-            container.innerHTML = '<p>No filaments available</p>';
+            const message = document.createElement('p');
+            message.textContent = 'No filaments available';
+            container.replaceChildren(message);
             return;
         }
         
-        container.innerHTML = '';
+        container.replaceChildren();
         
         filamentUrls.forEach(url => {
             const item = document.createElement('div');
@@ -131,14 +164,15 @@ async function loadFilamentTags() {
             item.dataset.url = url.url;
             item.dataset.qr = url.qr_code_base64;
             
-            const colorHex = url.color_hex || '#ccc';
-            item.innerHTML = `
-                <div class="color-swatch" style="background-color: ${colorHex}"></div>
-                <div class="item-info">
-                    <div class="item-name">${url.filament_name}</div>
-                    <div class="item-details">${url.material} - ${url.brand}</div>
-                </div>
-            `;
+            const colorSwatch = document.createElement('div');
+            colorSwatch.className = 'color-swatch';
+            colorSwatch.style.backgroundColor = normalizedNfcColor(url.color_hex);
+            item.appendChild(colorSwatch);
+            appendNfcListCopy(
+                item,
+                String(url.filament_name || ''),
+                `${String(url.material || '')} - ${String(url.brand || '')}`,
+            );
             
             // Add click handler
             item.addEventListener('click', () => {
@@ -158,7 +192,9 @@ async function loadFilamentTags() {
         
     } catch (error) {
         console.error('Error loading filament tags:', error);
-        document.getElementById('filament-list-container').innerHTML = '<p>Error loading filaments</p>';
+        const message = document.createElement('p');
+        message.textContent = 'Error loading filaments';
+        document.getElementById('filament-list-container').replaceChildren(message);
     }
 }
 
@@ -174,7 +210,7 @@ async function loadLocationTags() {
         console.log('Location URLs:', locationUrls);
         
         // Clear container and add informational message
-        container.innerHTML = '';
+        container.replaceChildren();
         
         // Add informational banner about Spoolman locations
         const spoolmanURL = data.spoolman_url || '';
@@ -182,17 +218,31 @@ async function loadLocationTags() {
         messageBanner.className = 'nfc-info-banner';
         messageBanner.style.cssText = 'background: #fff3cd; border: 1px solid #ffeaa7; color: #856404; padding: 15px; margin-bottom: 15px; border-radius: 8px;';
         
-        let bannerHTML = '<strong>ℹ️ Location Management:</strong><br>';
-        bannerHTML += 'It is not possible via the Spoolman API to add locations automatically. ';
-        bannerHTML += 'To create locations, please do so via Spoolman. Then they will show up here.';
+        const bannerHeading = document.createElement('strong');
+        bannerHeading.textContent = 'ℹ️ Location Management:';
+        messageBanner.append(bannerHeading, document.createElement('br'));
+        messageBanner.appendChild(document.createTextNode(
+            'It is not possible via the Spoolman API to add locations automatically. ' +
+            'To create locations, please do so via Spoolman. Then they will show up here.',
+        ));
         
         if (spoolmanURL) {
-            // Append /locations to the Spoolman URL
-            const spoolmanLocationsURL = spoolmanURL.replace(/\/$/, '') + '/locations';
-            bannerHTML += '<br><br><a href="' + spoolmanLocationsURL + '" target="_blank" style="color: #856404; text-decoration: underline; font-weight: bold;">Open Spoolman →</a>';
+            try {
+                const parsedURL = new URL(spoolmanURL);
+                if (parsedURL.protocol === 'http:' || parsedURL.protocol === 'https:') {
+                    const link = document.createElement('a');
+                    link.href = new URL('/locations', parsedURL).href;
+                    link.target = '_blank';
+                    link.rel = 'noopener noreferrer';
+                    link.style.cssText = 'color: #856404; text-decoration: underline; font-weight: bold;';
+                    link.textContent = 'Open Spoolman →';
+                    messageBanner.append(document.createElement('br'), document.createElement('br'), link);
+                }
+            } catch (error) {
+                console.warn('Ignoring invalid Spoolman URL in NFC response', error);
+            }
         }
         
-        messageBanner.innerHTML = bannerHTML;
         container.appendChild(messageBanner);
         
         if (locationUrls.length === 0) {
@@ -210,22 +260,21 @@ async function loadLocationTags() {
             item.dataset.url = url.url;
             item.dataset.qr = url.qr_code_base64;
             
-            // Determine icon based on location type
-            let icon = '📦'; // Storage icon for storage locations
-            let iconHtml = icon;
+            const locationIcon = document.createElement('div');
+            locationIcon.className = 'location-icon';
             if (url.location_type === 'printer') {
-                iconHtml = '<img src="/static/images/3d-printer-icon.png" alt="3D Printer" style="width: 20px; height: 20px;">';
+                const image = document.createElement('img');
+                image.src = '/static/images/3d-printer-icon.png';
+                image.alt = '3D Printer';
+                image.style.cssText = 'width: 20px; height: 20px;';
+                locationIcon.appendChild(image);
+            } else {
+                locationIcon.textContent = '📦';
             }
-            
-            item.innerHTML = `
-                <div class="location-icon">${iconHtml}</div>
-                <div class="item-info">
-                    <div class="item-name">${url.display_name}</div>
-                </div>
-                <div class="location-actions">
-                    ${renderLocationActions(url)}
-                </div>
-            `;
+            item.appendChild(locationIcon);
+            appendNfcListCopy(item, String(url.display_name || ''), null);
+            const actions = createLocationActions(url);
+            if (actions) item.appendChild(actions);
             
             // Add click handler
             item.addEventListener('click', (e) => {
@@ -256,33 +305,52 @@ async function loadLocationTags() {
         
     } catch (error) {
         console.error('Error loading location tags:', error);
-        document.getElementById('location-list-container').innerHTML = '<p>Error loading locations</p>';
+        const message = document.createElement('p');
+        message.textContent = 'Error loading locations';
+        document.getElementById('location-list-container').replaceChildren(message);
     }
 }
 
-// Render inline actions for FilaBridge-managed locations
-function renderLocationActions(url) {
-    try {
-        // Only show actions for non-printer locations (printer locations are virtual)
-        if (url.location_type === 'printer') return '';
-        
-        const nameAttr = (url.display_name || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
-        
-        // Show rename for all FilaBridge locations
-        let actions = `<a href="javascript:void(0)" onclick="event.preventDefault(); event.stopPropagation(); renameLocation('${nameAttr}');">Rename</a>`;
-        
-        // Show delete for local-only locations (not synced to Spoolman)
-        if (url.is_local_only) {
-            actions += ` • <a href="javascript:void(0)" onclick="event.preventDefault(); event.stopPropagation(); deleteLocation('${nameAttr}');" style="color: #ff6b6b;">Delete</a>`;
-        } else {
-            actions += ` <span style="color: #666; font-size: 0.9em;">(Synced to Spoolman)</span>`;
-        }
-        
-        return `<span style="margin-left:8px; font-weight:normal;">${actions}</span>`;
-    } catch (error) {
-        console.error('Error rendering location actions:', error);
-        return '';
+// Create actions without putting location names into HTML or handler strings.
+function createLocationActions(url) {
+    if (url.location_type === 'printer') return null;
+    const name = String(url.display_name || '');
+    const actions = document.createElement('div');
+    actions.className = 'location-actions';
+    actions.style.cssText = 'margin-left: 8px; font-weight: normal;';
+
+    const rename = document.createElement('button');
+    rename.type = 'button';
+    rename.className = 'nfc-link-button';
+    rename.style.cssText = 'background: none; border: 0; padding: 0; color: inherit; text-decoration: underline; cursor: pointer; font: inherit;';
+    rename.textContent = 'Rename';
+    rename.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        renameLocation(name);
+    });
+    actions.appendChild(rename);
+
+    if (url.is_local_only) {
+        actions.appendChild(document.createTextNode(' • '));
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'nfc-link-button';
+        remove.style.cssText = 'background: none; border: 0; padding: 0; color: #ff6b6b; text-decoration: underline; cursor: pointer; font: inherit;';
+        remove.textContent = 'Delete';
+        remove.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            deleteLocation(name);
+        });
+        actions.appendChild(remove);
+    } else {
+        const synced = document.createElement('span');
+        synced.style.cssText = 'color: #666; font-size: 0.9em;';
+        synced.textContent = ' (Synced to Spoolman)';
+        actions.appendChild(synced);
     }
+    return actions;
 }
 
 // Copy URL to clipboard
@@ -353,7 +421,7 @@ function displaySpoolQR(spoolData) {
     
     // Update content
     document.getElementById('spool-selected-name').textContent = `[${spoolData.spool_id}] ${spoolData.spool_name}`;
-    document.getElementById('spool-selected-details').innerHTML = ``;
+    document.getElementById('spool-selected-details').replaceChildren();
     document.getElementById('spool-qr-large').src = `data:image/png;base64,${spoolData.qr_code_base64}`;
     document.getElementById('spool-url-text').textContent = spoolData.url;
 }
@@ -371,7 +439,7 @@ function displayFilamentQR(filamentData) {
     
     // Update content
     document.getElementById('filament-selected-name').textContent = filamentData.filament_name;
-    document.getElementById('filament-selected-details').innerHTML = ``;
+    document.getElementById('filament-selected-details').replaceChildren();
     document.getElementById('filament-qr-large').src = `data:image/png;base64,${filamentData.qr_code_base64}`;
     document.getElementById('filament-url-text').textContent = filamentData.url;
 }
@@ -389,10 +457,18 @@ function displayLocationQR(locationData) {
     
     // Update content
     document.getElementById('location-selected-name').textContent = locationData.name;
-    document.getElementById('location-selected-details').innerHTML = `
-        <strong>Type:</strong> ${locationData.is_printer_location ? 'Printer Location' : 'Custom Location'}<br>
-        ${locationData.description ? `<strong>Description:</strong> ${locationData.description}<br>` : ''}
-    `;
+    const details = document.getElementById('location-selected-details');
+    details.replaceChildren();
+    const typeLabel = document.createElement('strong');
+    typeLabel.textContent = 'Type:';
+    details.append(typeLabel, document.createTextNode(
+        ` ${locationData.is_printer_location ? 'Printer Location' : 'Custom Location'}`,
+    ), document.createElement('br'));
+    if (locationData.description) {
+        const descriptionLabel = document.createElement('strong');
+        descriptionLabel.textContent = 'Description:';
+        details.append(descriptionLabel, document.createTextNode(` ${String(locationData.description)}`), document.createElement('br'));
+    }
     document.getElementById('location-qr-large').src = `data:image/png;base64,${locationData.qr_code_base64}`;
     document.getElementById('location-url-text').textContent = locationData.url;
 }
@@ -568,17 +644,30 @@ function showQrCode(url, title, qrCodeBase64) {
     
     // Display real QR code or placeholder
     const qrCodeDiv = document.getElementById('qr-code');
-    if (qrCodeBase64 && qrCodeBase64 !== '') {
-        qrCodeDiv.innerHTML = `<img src="data:image/png;base64,${qrCodeBase64}" alt="QR Code" style="width: 256px; height: 256px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">`;
+    qrCodeDiv.replaceChildren();
+    if (typeof qrCodeBase64 === 'string' && /^[A-Za-z0-9+/]+={0,2}$/.test(qrCodeBase64)) {
+        const image = document.createElement('img');
+        image.src = `data:image/png;base64,${qrCodeBase64}`;
+        image.alt = 'QR Code';
+        image.style.cssText = 'width: 256px; height: 256px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.15);';
+        qrCodeDiv.appendChild(image);
     } else {
         // Fallback placeholder if QR code generation failed
-        qrCodeDiv.innerHTML = `<div style="width: 256px; height: 256px; background: #f0f0f0; display: flex; align-items: center; justify-content: center; border: 2px dashed #ccc; border-radius: 8px;">
-            <div style="text-align: center;">
-                <div style="font-size: 48px; margin-bottom: 10px;">⚠️</div>
-                <div style="font-size: 12px; color: #666;">QR Code Error</div>
-                <div style="font-size: 10px; color: #999;">Copy URL manually</div>
-            </div>
-        </div>`;
+        const placeholder = document.createElement('div');
+        placeholder.style.cssText = 'width: 256px; height: 256px; background: #f0f0f0; display: flex; align-items: center; justify-content: center; border: 2px dashed #ccc; border-radius: 8px; text-align: center;';
+        const copy = document.createElement('div');
+        for (const [text, style] of [
+            ['⚠️', 'font-size: 48px; margin-bottom: 10px;'],
+            ['QR Code Error', 'font-size: 12px; color: #666;'],
+            ['Copy URL manually', 'font-size: 10px; color: #999;'],
+        ]) {
+            const line = document.createElement('div');
+            line.style.cssText = style;
+            line.textContent = text;
+            copy.appendChild(line);
+        }
+        placeholder.appendChild(copy);
+        qrCodeDiv.appendChild(placeholder);
     }
     
     // Show modal
@@ -599,4 +688,3 @@ window.onclick = function(event) {
         closeQrModal();
     }
 }
-

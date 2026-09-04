@@ -4,13 +4,19 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"time"
 )
+
+// ErrSpoolmanTagAPIUnsupported means the connected instance does not expose
+// the requested optional tag operation.
+var ErrSpoolmanTagAPIUnsupported = errors.New("Spoolman tag API is unsupported")
 
 // SpoolmanClient handles communication with Spoolman API for bridge functionality
 type SpoolmanClient struct {
@@ -18,6 +24,71 @@ type SpoolmanClient struct {
 	httpClient *http.Client
 	username   string
 	password   string
+}
+
+// SpoolmanCapabilities describes optional API operations exposed by a Spoolman instance.
+type SpoolmanCapabilities struct {
+	TagUIDLookup   bool `json:"tag_uid_lookup"`
+	TagAssociation bool `json:"tag_association"`
+}
+
+type spoolmanOpenAPIParameter struct {
+	Name string `json:"name"`
+	In   string `json:"in"`
+}
+
+type spoolmanOpenAPIOperation struct {
+	Parameters []spoolmanOpenAPIParameter `json:"parameters"`
+}
+
+type spoolmanOpenAPIPath struct {
+	Get  *spoolmanOpenAPIOperation `json:"get"`
+	Post *spoolmanOpenAPIOperation `json:"post"`
+}
+
+type spoolmanOpenAPISchema struct {
+	Paths map[string]spoolmanOpenAPIPath `json:"paths"`
+}
+
+// DetectCapabilities inspects Spoolman's OpenAPI schema instead of assuming
+// features from its version number.
+func (c *SpoolmanClient) DetectCapabilities() (SpoolmanCapabilities, error) {
+	req, err := http.NewRequest(http.MethodGet, c.baseURL+"/api/v1/openapi.json", nil)
+	if err != nil {
+		return SpoolmanCapabilities{}, fmt.Errorf("error creating Spoolman capability request: %w", err)
+	}
+	c.addAuthHeader(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return SpoolmanCapabilities{}, fmt.Errorf("error detecting Spoolman capabilities: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return SpoolmanCapabilities{}, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return SpoolmanCapabilities{}, c.handleAPIError(resp)
+	}
+
+	var schema spoolmanOpenAPISchema
+	if err := json.NewDecoder(resp.Body).Decode(&schema); err != nil {
+		return SpoolmanCapabilities{}, fmt.Errorf("error decoding Spoolman OpenAPI schema: %w", err)
+	}
+
+	capabilities := SpoolmanCapabilities{}
+	if operation := schema.Paths["/spool"].Get; operation != nil {
+		for _, parameter := range operation.Parameters {
+			if parameter.Name == "tag" && parameter.In == "query" {
+				capabilities.TagUIDLookup = true
+				break
+			}
+		}
+	}
+	capabilities.TagAssociation = schema.Paths["/spool/{spool_id}/tag"].Post != nil
+
+	return capabilities, nil
 }
 
 // GetBaseURL returns the Spoolman base URL
@@ -41,12 +112,20 @@ type SpoolmanSpool struct {
 	Archived        bool                   `json:"archived"`
 	LocationID      *int                   `json:"location_id"` // Reference to Spoolman Location entity
 	Extra           map[string]interface{} `json:"extra"`
+	Tags            []SpoolmanTag          `json:"tags"`
 
 	// Computed fields for easier access
 	Name     string `json:"name"`     // Computed from filament.name
 	Brand    string `json:"brand"`    // Computed from filament.vendor.name
 	Material string `json:"material"` // Computed from filament.material
 	Location string `json:"location"` // Spool location (e.g., "Printer1 - Toolhead 0") - kept for backward compatibility
+}
+
+// SpoolmanTag identifies a physical NFC/RFID tag associated with a spool.
+type SpoolmanTag struct {
+	UID    string `json:"uid"`
+	Format string `json:"format"`
+	Added  string `json:"added"`
 }
 
 // SpoolmanFilament represents a filament type from Spoolman
@@ -60,6 +139,7 @@ type SpoolmanFilament struct {
 	Diameter             float64                `json:"diameter"`
 	Weight               float64                `json:"weight"`
 	SpoolWeight          float64                `json:"spool_weight"`
+	Price                float64                `json:"price"`
 	SettingsExtruderTemp int                    `json:"settings_extruder_temp"`
 	SettingsBedTemp      int                    `json:"settings_bed_temp"`
 	ColorHex             string                 `json:"color_hex"`
@@ -258,6 +338,99 @@ func (c *SpoolmanClient) GetSpool(spoolID int) (*SpoolmanSpool, error) {
 
 	normalized := c.normalizeSpoolData(spool)
 	return &normalized, nil
+}
+
+// LookupSpoolByTagUID returns the one spool associated with uid, or nil when
+// the supported tag API has no association.
+func (c *SpoolmanClient) LookupSpoolByTagUID(uid string) (*SpoolmanSpool, error) {
+	capabilities, err := c.DetectCapabilities()
+	if err != nil {
+		return nil, err
+	}
+	if !capabilities.TagUIDLookup {
+		return nil, ErrSpoolmanTagAPIUnsupported
+	}
+
+	endpoint, err := url.Parse(c.baseURL + "/api/v1/spool")
+	if err != nil {
+		return nil, fmt.Errorf("error creating Spoolman tag lookup URL: %w", err)
+	}
+	query := endpoint.Query()
+	query.Set("tag", uid)
+	endpoint.RawQuery = query.Encode()
+
+	req, err := http.NewRequest(http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating Spoolman tag lookup request: %w", err)
+	}
+	c.addAuthHeader(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error looking up Spoolman tag: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, c.handleAPIError(resp)
+	}
+
+	var spools []SpoolmanSpool
+	if err := json.NewDecoder(resp.Body).Decode(&spools); err != nil {
+		return nil, fmt.Errorf("error decoding Spoolman tag lookup: %w", err)
+	}
+	if len(spools) == 0 {
+		return nil, nil
+	}
+	if len(spools) != 1 {
+		return nil, fmt.Errorf("Spoolman tag lookup returned %d spools, want at most one", len(spools))
+	}
+
+	normalized := c.normalizeSpoolData(spools[0])
+	return &normalized, nil
+}
+
+// AssociateTagWithSpool links a physical tag UID to a Spoolman spool.
+func (c *SpoolmanClient) AssociateTagWithSpool(spoolID int, uid, tagFormat string) (*SpoolmanTag, error) {
+	capabilities, err := c.DetectCapabilities()
+	if err != nil {
+		return nil, err
+	}
+	if !capabilities.TagAssociation {
+		return nil, ErrSpoolmanTagAPIUnsupported
+	}
+
+	body, err := json.Marshal(struct {
+		UID    string `json:"uid"`
+		Format string `json:"format,omitempty"`
+	}{UID: uid, Format: tagFormat})
+	if err != nil {
+		return nil, fmt.Errorf("error encoding Spoolman tag association: %w", err)
+	}
+
+	endpoint := fmt.Sprintf("%s/api/v1/spool/%d/tag", c.baseURL, spoolID)
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("error creating Spoolman tag association request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.addAuthHeader(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error associating tag with Spoolman spool %d: %w", spoolID, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		return nil, c.handleAPIError(resp)
+	}
+
+	var tag SpoolmanTag
+	if err := json.NewDecoder(resp.Body).Decode(&tag); err != nil {
+		return nil, fmt.Errorf("error decoding Spoolman tag association: %w", err)
+	}
+	return &tag, nil
 }
 
 // GetAllFilaments gets all filament types from Spoolman

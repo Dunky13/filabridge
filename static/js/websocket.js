@@ -150,32 +150,49 @@ function updatePrinterStatuses(printers) {
             return;
         }
 
-        const progressMarkup = `
-            <div class="printer-progress">
-                <div class="printer-progress-header">
-                    <div>
-                        <div class="printer-progress-label">Current Print</div>
-                        <div class="printer-progress-job">${escapeHtml(printerData.current_job || 'Active job')}</div>
-                    </div>
-                    <div class="printer-progress-percent">${Math.round(printerData.progress || 0)}%</div>
-                </div>
-                <div class="printer-progress-bar" aria-label="Print progress">
-                    <div class="printer-progress-fill" style="width: ${Math.max(0, Math.min(100, printerData.progress || 0))}%;"></div>
-                </div>
-                <div class="printer-progress-meta">
-                    <span>Elapsed: ${formatDuration(printerData.print_time || 0)}</span>
-                    <span>Remaining: ${formatDuration(printerData.print_time_left || 0)}</span>
-                    <span>ETA: ${formatEta(printerData.print_time_left || 0)}</span>
-                </div>
-            </div>
-        `;
+        const progress = document.createElement('div');
+        progress.className = 'printer-progress';
+        const header = document.createElement('div');
+        header.className = 'printer-progress-header';
+        const titleGroup = document.createElement('div');
+        const label = document.createElement('div');
+        label.className = 'printer-progress-label';
+        label.textContent = 'Current Print';
+        const job = document.createElement('div');
+        job.className = 'printer-progress-job';
+        job.textContent = String(printerData.current_job || 'Active job');
+        titleGroup.append(label, job);
+        const percentage = Math.max(0, Math.min(100, Number(printerData.progress) || 0));
+        const percent = document.createElement('div');
+        percent.className = 'printer-progress-percent';
+        percent.textContent = `${Math.round(percentage)}%`;
+        header.append(titleGroup, percent);
+        const progressBar = document.createElement('div');
+        progressBar.className = 'printer-progress-bar';
+        progressBar.setAttribute('aria-label', 'Print progress');
+        const fill = document.createElement('div');
+        fill.className = 'printer-progress-fill';
+        fill.style.width = `${percentage}%`;
+        progressBar.appendChild(fill);
+        const meta = document.createElement('div');
+        meta.className = 'printer-progress-meta';
+        for (const text of [
+            `Elapsed: ${formatDuration(printerData.print_time || 0)}`,
+            `Remaining: ${formatDuration(printerData.print_time_left || 0)}`,
+            `ETA: ${formatEta(printerData.print_time_left || 0)}`,
+        ]) {
+            const item = document.createElement('span');
+            item.textContent = text;
+            meta.appendChild(item);
+        }
+        progress.append(header, progressBar, meta);
 
         if (existingProgress) {
-            existingProgress.outerHTML = progressMarkup;
+            existingProgress.replaceWith(progress);
         } else {
             const modelInfo = printerElement.querySelector('p');
             if (modelInfo) {
-                modelInfo.insertAdjacentHTML('afterend', progressMarkup);
+                modelInfo.insertAdjacentElement('afterend', progress);
             }
         }
     });
@@ -225,10 +242,26 @@ function formatEta(totalSeconds) {
     return eta.toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false});
 }
 
-function escapeHtml(value) {
-    const div = document.createElement('div');
-    div.textContent = value == null ? '' : String(value);
-    return div.innerHTML;
+function normalizedWebsocketColor(value) {
+    const color = String(value || '').replace(/^#/, '');
+    return /^(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(color)
+        ? `#${color}`
+        : '#ccc';
+}
+
+function renderSpoolDropdownButton(button, selectedText, selectedColor) {
+    const value = document.createElement('div');
+    value.style.cssText = 'display: flex; align-items: center; gap: 10px;';
+    const swatch = document.createElement('div');
+    swatch.className = 'color-swatch';
+    swatch.style.backgroundColor = normalizedWebsocketColor(selectedColor);
+    const text = document.createElement('span');
+    text.textContent = String(selectedText || 'Select a spool...');
+    value.append(swatch, text);
+    const arrow = document.createElement('span');
+    arrow.className = 'dropdown-arrow';
+    arrow.textContent = '▼';
+    button.replaceChildren(value, arrow);
 }
 
 function updateSpoolData(spools) {
@@ -239,7 +272,7 @@ function updateSpoolData(spools) {
         
         // Clear existing options except "Empty"
         const selectOption = optionsContainer.querySelector('.dropdown-option[data-value=""]');
-        optionsContainer.innerHTML = '';
+        optionsContainer.replaceChildren();
         if (selectOption) {
             optionsContainer.appendChild(selectOption);
         }
@@ -366,13 +399,7 @@ function updateToolheadMappings(mappings) {
                     const selectedColor = spoolOption.dataset.color;
                     
                     // Update button display
-                    dropdownButton.innerHTML = `
-                        <div style="display: flex; align-items: center; gap: 10px;">
-                            <div class="color-swatch" style="background-color: #${selectedColor || 'ccc'};"></div>
-                            <span>${selectedText}</span>
-                        </div>
-                        <span class="dropdown-arrow">▼</span>
-                    `;
+                    renderSpoolDropdownButton(dropdownButton, selectedText, selectedColor);
                     
                     // Mark as selected
                     optionsContainer.querySelectorAll('.dropdown-option').forEach(opt => {
@@ -393,10 +420,7 @@ function updateToolheadMappings(mappings) {
             }
             
             // Set to empty state
-            dropdownButton.innerHTML = `
-                <span>Select a spool...</span>
-                <span class="dropdown-arrow">▼</span>
-            `;
+            renderSpoolDropdownButton(dropdownButton, 'Select a spool...', 'ccc');
             
             // Clear selected state
             if (optionsContainer) {
@@ -418,7 +442,7 @@ function updatePrintErrors(printErrors) {
     if (!container) return;
     
     // Clear existing errors
-    container.innerHTML = '';
+    container.replaceChildren();
     
     if (printErrors.length === 0) {
         container.style.display = 'none';
@@ -431,20 +455,35 @@ function updatePrintErrors(printErrors) {
     printErrors.forEach(error => {
         const errorElement = document.createElement('div');
         errorElement.className = 'print-error';
-        errorElement.setAttribute('data-error-id', error.id);
+        errorElement.dataset.errorId = String(error.id || '');
         errorElement.style.cssText = 'background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; padding: 20px; margin: 20px 0; border-radius: 8px;';
         
         const timestamp = new Date(error.timestamp).toLocaleString();
-        
-        errorElement.innerHTML = `
-            <h4 style="margin-top: 0;">⚠️ Print Processing Failed</h4>
-            <p><strong>Printer:</strong> ${error.printer_name}</p>
-            <p><strong>File:</strong> ${error.filename}</p>
-            <p><strong>Time:</strong> ${timestamp}</p>
-            <p><strong>Error:</strong> ${error.error}</p>
-            <p><strong>Action Required:</strong> Please update Spoolman manually with the correct filament usage for this print.</p>
-            <button class="btn" onclick="acknowledgeError('${error.id}')" style="background: #dc3545; margin-top: 10px;">Acknowledge</button>
-        `;
+
+        const heading = document.createElement('h4');
+        heading.style.marginTop = '0';
+        heading.textContent = '⚠️ Print Processing Failed';
+        errorElement.appendChild(heading);
+
+        const appendDetail = (label, value) => {
+            const paragraph = document.createElement('p');
+            const strong = document.createElement('strong');
+            strong.textContent = label + ':';
+            paragraph.append(strong, document.createTextNode(' ' + String(value ?? '')));
+            errorElement.appendChild(paragraph);
+        };
+        appendDetail('Printer', error.printer_name);
+        appendDetail('File', error.filename);
+        appendDetail('Time', timestamp);
+        appendDetail('Error', error.error);
+        appendDetail('Action Required', 'Please update Spoolman manually with the correct filament usage for this print.');
+
+        const acknowledgeButton = document.createElement('button');
+        acknowledgeButton.className = 'btn';
+        acknowledgeButton.style.cssText = 'background: #dc3545; margin-top: 10px;';
+        acknowledgeButton.textContent = 'Acknowledge';
+        acknowledgeButton.addEventListener('click', () => acknowledgeError(String(error.id || '')));
+        errorElement.appendChild(acknowledgeButton);
         
         container.appendChild(errorElement);
     });
@@ -462,7 +501,8 @@ async function acknowledgeError(errorId) {
 
         if (response.ok) {
             // Remove the error from the UI
-            const errorElement = document.querySelector(`[data-error-id="${errorId}"]`);
+            const errorElement = Array.from(document.querySelectorAll('[data-error-id]'))
+                .find(element => element.dataset.errorId === String(errorId));
             if (errorElement) {
                 errorElement.remove();
             }

@@ -1,5 +1,82 @@
 // FilaBridge Dashboard - Printer Management Functions
 
+const printerPresetsById = new Map();
+let printerPresetsPromise;
+
+function loadPrinterPresets() {
+    if (printerPresetsPromise) return printerPresetsPromise;
+
+    printerPresetsPromise = fetch('/api/printer-presets')
+        .then(response => {
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            return response.json();
+        })
+        .then(data => {
+            printerPresetsById.clear();
+            (data.presets || []).forEach(preset => printerPresetsById.set(preset.id, preset));
+            populatePrinterPresetSelect('printerPreset', data.presets || [], data.custom_preset_id);
+            populatePrinterPresetSelect('editPrinterPreset', data.presets || [], data.custom_preset_id);
+            applyPrinterPresetSelection('add');
+        })
+        .catch(error => {
+            printerPresetsPromise = undefined;
+            console.error('Error loading printer presets:', error);
+            throw error;
+        });
+
+    return printerPresetsPromise;
+}
+
+function populatePrinterPresetSelect(elementId, presets, customPresetId) {
+    const select = document.getElementById(elementId);
+    if (!select) return;
+
+    const selected = select.value || customPresetId || 'custom';
+    select.replaceChildren();
+    const groups = new Map();
+    presets.forEach(preset => {
+        if (!groups.has(preset.group)) {
+            const group = document.createElement('optgroup');
+            group.label = preset.group;
+            groups.set(preset.group, group);
+            select.appendChild(group);
+        }
+        const option = document.createElement('option');
+        option.value = preset.id;
+        option.textContent = `${preset.name}${preset.preview ? ' (Preview)' : ''}`;
+        groups.get(preset.group).appendChild(option);
+    });
+
+    const custom = document.createElement('option');
+    custom.value = customPresetId || 'custom';
+    custom.textContent = 'Custom / auto-detect';
+    select.appendChild(custom);
+    select.value = printerPresetsById.has(selected) ? selected : custom.value;
+}
+
+function applyPrinterPresetSelection(formName, customModel, customToolheads) {
+    const edit = formName === 'edit';
+    const presetSelect = document.getElementById(edit ? 'editPrinterPreset' : 'printerPreset');
+    const modelInput = document.getElementById(edit ? 'editPrinterModel' : 'printerModel');
+    const toolheadsInput = document.getElementById(edit ? 'editPrinterToolheads' : 'printerToolheads');
+    if (!presetSelect || !modelInput || !toolheadsInput) return;
+
+    const preset = printerPresetsById.get(presetSelect.value);
+    const custom = !preset;
+    modelInput.readOnly = !custom;
+    toolheadsInput.readOnly = !custom;
+    if (preset) {
+        modelInput.value = preset.model;
+        toolheadsInput.value = preset.toolheads;
+    } else if (customModel !== undefined) {
+        modelInput.value = customModel;
+        toolheadsInput.value = customToolheads || 1;
+    }
+    if (edit && document.getElementById('editPrinterModal').style.display === 'block') {
+        renderLogicalToolRoutes(parseInt(toolheadsInput.value), {});
+    }
+}
+
 // Helper function to escape HTML attribute values to prevent XSS
 function escapeHtmlAttribute(value) {
     if (value == null) return '';
@@ -44,10 +121,10 @@ function loadPrinters() {
                     }
                     
                     printerCard.innerHTML = `
-                        <h3>${printer.name || 'Unknown Printer'}</h3>
+                        <h3>${escapeHtmlAttribute(printer.name || 'Unknown Printer')}</h3>
                         <div class="printer-info">
-                            <div><strong>Model:</strong> ${printer.model || 'Unknown'} (${printer.toolheads || 1} toolhead${printer.toolheads > 1 ? 's' : ''})</div>
-                            <div><strong>Address:</strong> ${printer.ip_address || 'Not configured'}</div>
+                            <div><strong>Model:</strong> ${escapeHtmlAttribute(printer.model || 'Unknown')} (${printer.toolheads || 1} toolhead${printer.toolheads > 1 ? 's' : ''})</div>
+                            <div><strong>Address:</strong> ${escapeHtmlAttribute(printer.ip_address || 'Not configured')}</div>
                             <div><strong>API Key:</strong> ${printer.api_key ? '••••••••' : 'Not configured'}</div>
                         </div>
                         <div class="printer-actions">
@@ -79,6 +156,7 @@ function loadPrinters() {
 function showAddPrinterForm() {
     document.getElementById('addPrinterModal').style.display = 'block';
     document.getElementById('addPrinterForm').reset();
+    applyPrinterPresetSelection('add', '', 1);
     
     // Reset button state AFTER form reset with a fresh query
     // Use setTimeout to ensure DOM is updated
@@ -150,10 +228,17 @@ document.getElementById('addPrinterForm').addEventListener('submit', function(e)
     }
     
     const formData = new FormData(this);
-    const name = formData.get('name');
-    const ipAddress = formData.get('ip_address');
-    const apiKey = formData.get('api_key');
-    const toolheads = parseInt(formData.get('toolheads'));
+    const printerConfig = {
+        name: formData.get('name'),
+        preset_id: formData.get('preset_id'),
+        model: formData.get('model'),
+        ip_address: formData.get('ip_address'),
+        api_key: formData.get('api_key'),
+        prusalink_username: formData.get('prusalink_username'),
+        prusalink_password: formData.get('prusalink_password'),
+        prusalink_custom_ca_pem: formData.get('prusalink_custom_ca_pem'),
+        toolheads: parseInt(formData.get('toolheads'))
+    };
     
     // Show loading state
     const submitButton = this.querySelector('button[type="submit"]');
@@ -162,7 +247,7 @@ document.getElementById('addPrinterForm').addEventListener('submit', function(e)
     submitButton.textContent = 'Detecting model...';
     
     // First detect printer model, then add printer
-    detectModelAndAddPrinter(name, ipAddress, apiKey, toolheads, submitButton, originalText);
+    detectModelAndAddPrinter(printerConfig, submitButton, originalText);
 });
 
 // Handle edit form submission
@@ -172,9 +257,13 @@ document.getElementById('editPrinterForm').addEventListener('submit', function(e
     const formData = new FormData(this);
     const printerId = formData.get('printerId');
     const name = formData.get('name');
+    const presetId = formData.get('preset_id');
     const model = formData.get('model');
     const ipAddress = formData.get('ip_address');
     const apiKey = formData.get('api_key');
+    const prusaLinkUsername = formData.get('prusalink_username');
+    const prusaLinkPassword = formData.get('prusalink_password');
+    const prusaLinkCustomCAPEM = formData.get('prusalink_custom_ca_pem');
     const toolheads = parseInt(formData.get('toolheads'));
     
     // Validate printerId is present
@@ -197,9 +286,16 @@ document.getElementById('editPrinterForm').addEventListener('submit', function(e
     // Create printer config
     const printerConfig = {
         name: name,
+        preset_id: presetId,
         model: model,
         ip_address: ipAddress,
         api_key: apiKey,
+        prusalink_username: prusaLinkUsername,
+        prusalink_password: prusaLinkPassword,
+        prusalink_custom_ca_pem: prusaLinkCustomCAPEM,
+        clear_api_key: formData.get('clear_api_key') === 'on',
+        clear_prusalink_credentials: formData.get('clear_prusalink_credentials') === 'on',
+        clear_prusalink_custom_ca_pem: formData.get('clear_prusalink_custom_ca_pem') === 'on',
         toolheads: toolheads
     };
     
@@ -215,7 +311,9 @@ document.getElementById('editPrinterForm').addEventListener('submit', function(e
             throw new Error(data.error);
         }
         
-        // Success - close modal and refresh
+        return saveLogicalToolRoutes(printerId);
+    })
+    .then(() => {
         closeEditPrinterModal();
         loadPrinters();
     })
@@ -229,14 +327,17 @@ document.getElementById('editPrinterForm').addEventListener('submit', function(e
     });
 });
 
-function detectModelAndAddPrinter(name, ipAddress, apiKey, toolheads, submitButton, originalText) {
+function detectModelAndAddPrinter(printerConfig, submitButton, originalText) {
     // Detect printer model only
     fetch('/api/detect_printer', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
-            ip_address: ipAddress,
-            api_key: apiKey
+            ip_address: printerConfig.ip_address,
+            api_key: printerConfig.api_key,
+            prusalink_username: printerConfig.prusalink_username,
+            prusalink_password: printerConfig.prusalink_password,
+            prusalink_custom_ca_pem: printerConfig.prusalink_custom_ca_pem
         })
     })
     .then(response => response.json())
@@ -251,14 +352,10 @@ function detectModelAndAddPrinter(name, ipAddress, apiKey, toolheads, submitButt
             console.warn('Printer detection failed:', data.warning);
         }
         
-        // Create printer config with detected model (or "Unknown" if detection failed)
-        const printerConfig = {
-            name: name,
-            model: data.model || "Unknown",
-            ip_address: ipAddress,
-            api_key: apiKey,
-            toolheads: toolheads
-        };
+        // Presets are authoritative. Detection only fills a custom blank model.
+        if (printerConfig.preset_id === 'custom' && !printerConfig.model.trim()) {
+            printerConfig.model = data.model || 'Unknown';
+        }
         
         // Add the printer
         return addPrinter(printerConfig);
@@ -278,9 +375,8 @@ function detectModelAndAddPrinter(name, ipAddress, apiKey, toolheads, submitButt
 
 function editPrinter(printerId) {
     // Get the current printer data
-    fetch('/api/printers')
-        .then(response => response.json())
-        .then(data => {
+    Promise.all([fetch('/api/printers').then(response => response.json()), loadPrinterPresets()])
+        .then(([data]) => {
             const printer = data.printers[printerId];
             if (!printer) {
                 alert('Printer not found');
@@ -290,10 +386,22 @@ function editPrinter(printerId) {
             // Populate the edit form with current data
             document.getElementById('editPrinterId').value = printerId;
             document.getElementById('editPrinterName').value = printer.name || '';
-            document.getElementById('editPrinterModel').value = printer.model || '';
             document.getElementById('editPrinterIP').value = printer.ip_address || '';
-            document.getElementById('editPrinterAPIKey').value = printer.api_key || '';
-            document.getElementById('editPrinterToolheads').value = printer.toolheads || 1;
+            document.getElementById('editPrinterAPIKey').value = '';
+            document.getElementById('editPrinterAPIKey').placeholder = printer.api_key_configured ? 'Stored — leave blank to keep' : 'Your PrusaLink API key';
+            document.getElementById('editPrinterPrusaLinkUsername').value = printer.prusalink_username || '';
+            document.getElementById('editPrinterPrusaLinkPassword').value = '';
+            document.getElementById('editPrinterPrusaLinkPassword').placeholder = printer.prusalink_password_configured ? 'Stored — leave blank to keep' : '';
+            document.getElementById('editPrinterPrusaLinkCA').value = '';
+            document.getElementById('editPrinterPrusaLinkCA').placeholder = printer.prusalink_custom_ca_configured ? 'Stored — leave blank to keep' : '-----BEGIN CERTIFICATE-----';
+            document.getElementById('editPrinterClearAPIKey').checked = false;
+            document.getElementById('editPrinterClearDigest').checked = false;
+            document.getElementById('editPrinterClearCA').checked = false;
+            document.getElementById('editPrinterPreset').value = printer.preset_id || 'custom';
+            applyPrinterPresetSelection('edit', printer.model || '', printer.toolheads || 1);
+            return loadLogicalToolRoutes(printerId, printer.toolheads || 1);
+        })
+        .then(() => {
             
             // Show the edit modal
             document.getElementById('editPrinterModal').style.display = 'block';
@@ -303,6 +411,57 @@ function editPrinter(printerId) {
             alert('Error loading printer data');
         });
 }
+
+function loadLogicalToolRoutes(printerId, toolheads) {
+    return fetch(`/api/printers/${printerId}/tool-routes`)
+        .then(response => response.json())
+        .then(data => {
+            if (data.error) throw new Error(data.error);
+            renderLogicalToolRoutes(toolheads, data.routes || {});
+        });
+}
+
+function renderLogicalToolRoutes(toolheads, routes) {
+    const container = document.getElementById('editPrinterToolRoutes');
+    container.innerHTML = '';
+    for (let logicalToolId = 0; logicalToolId < toolheads; logicalToolId++) {
+        const row = document.createElement('label');
+        row.textContent = `Slicer tool ${logicalToolId} → `;
+        const select = document.createElement('select');
+        select.dataset.logicalToolId = String(logicalToolId);
+        for (let physicalToolheadId = 0; physicalToolheadId < toolheads; physicalToolheadId++) {
+            const option = document.createElement('option');
+            option.value = String(physicalToolheadId);
+            option.textContent = `Physical input ${physicalToolheadId}`;
+            select.appendChild(option);
+        }
+        select.value = String(routes[logicalToolId] ?? logicalToolId);
+        row.appendChild(select);
+        container.appendChild(row);
+    }
+}
+
+function saveLogicalToolRoutes(printerId) {
+    const selects = document.querySelectorAll('#editPrinterToolRoutes select[data-logical-tool-id]');
+    return Promise.all(Array.from(selects, select => fetch(
+        `/api/printers/${printerId}/tool-routes/${select.dataset.logicalToolId}`,
+        {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({physical_toolhead_id: parseInt(select.value)})
+        }
+    ).then(response => {
+        if (!response.ok) return response.json().then(data => { throw new Error(data.error || 'Failed to save tool route'); });
+        return response.json();
+    })));
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadPrinterPresets().catch(() => {
+        const addHelp = document.querySelector('#printerPreset + small');
+        if (addHelp) addHelp.textContent = 'Preset catalog failed to load. Custom settings remain available.';
+    });
+});
 
 function deletePrinter(printerId) {
     if (confirm('Are you sure you want to delete this printer?')) {

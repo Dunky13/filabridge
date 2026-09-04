@@ -1,0 +1,65 @@
+[
+  {
+    "version": "2.9.6",
+    "format": "gcode",
+    "tool_count": 1,
+    "path": "testdata/compatibility/prusaslicer-2.9.6-single.gcode",
+    "expected_grams": {"0": 7.25}
+  },
+  {
+    "version": "2.9.6",
+    "format": "gcode",
+    "tool_count": 3,
+    "path": "testdata/compatibility/prusaslicer-2.9.6-multi.gcode",
+    "expected_grams": {"0": 1.25, "2": 2.75}
+  },
+  {
+    "version": "2.9.6",
+    "format": "bgcode-generated-single",
+    "tool_count": 1,
+    "metadata": "filament used [g]=7.25\n",
+    "expected_grams": {"0": 7.25}
+  },
+  {
+    "version": "2.9.6",
+    "format": "bgcode-generated-multi",
+    "tool_count": 3,
+    "metadata": "filament used [g]=1.25, 0, 2.75\n",
+    "expected_grams": {"0": 1.25, "2": 2.75}
+  },
+  {
+    "version": "3.0.0-alpha11",
+    "format": "gcode",
+    "tool_count": 1,
+    "path": "testdata/compatibility/prusaslicer-3.0.0-alpha11-single.gcode",
+    "expected_grams": {"0": 8.5}
+  },
+  {
+    "version": "3.0.0-alpha11",
+    "format": "gcode",
+    "tool_count": 8,
+    "path": "testdata/compatibility/prusaslicer-3.0.0-alpha11-multi.gcode",
+    "expected_grams": {"0": 1, "2": 2, "4": 3, "6": 4, "7": 8}
+  },
+  {
+    "version": "3.0.0-alpha11",
+    "format": "bgcode",
+    "tool_count": 3,
+    "path": "testdata/bgcode/official-alpha11-source.bgcode",
+    "expected_grams": {"0": 1.25, "2": 2.75}
+  },
+  {
+    "version": "3.0.0-alpha11",
+    "format": "bgcode-generated-single",
+    "tool_count": 1,
+    "metadata": "filament used [g]=8.5\n",
+    "expected_grams": {"0": 8.5}
+  },
+  {
+    "version": "3.0.0-alpha11",
+    "format": "bgcode-generated-indx-8t",
+    "tool_count": 8,
+    "metadata": "filament used [g]=1, 0, 2, 0, 3, 0, 4, 8\n",
+    "expected_grams": {"0": 1, "2": 2, "4": 3, "6": 4, "7": 8}
+  }
+]

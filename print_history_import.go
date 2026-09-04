@@ -93,6 +93,14 @@ func (j prusaConnectJob) ExternalJobID() string {
 	return strings.TrimSpace(j.ID.String())
 }
 
+func nullableTrimmedText(value string) any {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	return trimmed
+}
+
 func (j prusaConnectJob) JobName() string {
 	switch {
 	case strings.TrimSpace(j.File.DisplayName) != "":
@@ -110,99 +118,6 @@ func (j prusaConnectJob) JobName() string {
 
 func (j prusaConnectJob) HasRequiredTimes() bool {
 	return j.Start > 0 && j.End > 0 && j.End >= j.Start
-}
-
-func (b *FilamentBridge) ensurePrintHistoryImportSchema() error {
-	columns, err := b.getTableColumns("print_history")
-	if err != nil {
-		return err
-	}
-
-	alterStatements := []struct {
-		column string
-		query  string
-	}{
-		{
-			column: "import_source",
-			query:  "ALTER TABLE print_history ADD COLUMN import_source TEXT NOT NULL DEFAULT 'runtime'",
-		},
-		{
-			column: "external_job_id",
-			query:  "ALTER TABLE print_history ADD COLUMN external_job_id TEXT",
-		},
-		{
-			column: "external_lifetime_id",
-			query:  "ALTER TABLE print_history ADD COLUMN external_lifetime_id TEXT",
-		},
-		{
-			column: "external_printer_uuid",
-			query:  "ALTER TABLE print_history ADD COLUMN external_printer_uuid TEXT",
-		},
-		{
-			column: "print_state",
-			query:  "ALTER TABLE print_history ADD COLUMN print_state TEXT",
-		},
-		{
-			column: "source_path",
-			query:  "ALTER TABLE print_history ADD COLUMN source_path TEXT",
-		},
-	}
-
-	for _, statement := range alterStatements {
-		if columns[statement.column] {
-			continue
-		}
-		if _, err := b.db.Exec(statement.query); err != nil {
-			return fmt.Errorf("failed to add print_history.%s: %w", statement.column, err)
-		}
-	}
-
-	indexStatements := []string{
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_print_history_import_lifetime
-		ON print_history (import_source, external_lifetime_id, toolhead_id)
-		WHERE external_lifetime_id IS NOT NULL AND external_lifetime_id != ''`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_print_history_import_job
-		ON print_history (import_source, external_printer_uuid, external_job_id, toolhead_id)
-		WHERE external_printer_uuid IS NOT NULL AND external_printer_uuid != '' AND external_job_id IS NOT NULL AND external_job_id != ''`,
-	}
-
-	for _, statement := range indexStatements {
-		if _, err := b.db.Exec(statement); err != nil {
-			return fmt.Errorf("failed to create print history import index: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (b *FilamentBridge) getTableColumns(tableName string) (map[string]bool, error) {
-	rows, err := b.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
-	if err != nil {
-		return nil, fmt.Errorf("failed to inspect table %s: %w", tableName, err)
-	}
-	defer rows.Close()
-
-	columns := make(map[string]bool)
-	for rows.Next() {
-		var (
-			cid        int
-			name       string
-			columnType string
-			notNull    int
-			defaultVal sql.NullString
-			primaryKey int
-		)
-		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &primaryKey); err != nil {
-			return nil, fmt.Errorf("failed to inspect table %s columns: %w", tableName, err)
-		}
-		columns[name] = true
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate table %s columns: %w", tableName, err)
-	}
-
-	return columns, nil
 }
 
 func parsePrusaConnectJobs(payload []byte) ([]prusaConnectJob, error) {
@@ -335,7 +250,7 @@ func (b *FilamentBridge) ImportPrusaConnectPrintHistory(printerID string, defaul
 				continue
 			}
 
-			exists, err := b.printHistoryFingerprintExistsTx(tx, printerConfig.Name, toolheadID, jobName, printStarted, printFinished)
+			exists, err := b.printHistoryFingerprintExistsTx(tx, printerID, toolheadID, jobName, printStarted, printFinished)
 			if err != nil {
 				return nil, err
 			}
@@ -346,7 +261,8 @@ func (b *FilamentBridge) ImportPrusaConnectPrintHistory(printerID string, defaul
 
 			result, err := tx.Exec(`
 				INSERT OR IGNORE INTO print_history (
-					printer_name,
+					printer_id,
+					printer_name_at_event,
 					toolhead_id,
 					spool_id,
 					filament_used,
@@ -359,8 +275,9 @@ func (b *FilamentBridge) ImportPrusaConnectPrintHistory(printerID string, defaul
 					external_lifetime_id,
 					external_printer_uuid,
 					print_state
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			`,
+				printerID,
 				printerConfig.Name,
 				toolheadID,
 				nil,
@@ -371,7 +288,7 @@ func (b *FilamentBridge) ImportPrusaConnectPrintHistory(printerID string, defaul
 				strings.TrimSpace(job.Path),
 				printHistoryImportSourcePrusaConnect,
 				job.ExternalJobID(),
-				strings.TrimSpace(job.LifetimeID),
+				nullableTrimmedText(job.LifetimeID),
 				strings.TrimSpace(job.PrinterUUID),
 				strings.TrimSpace(job.State),
 			)
@@ -414,18 +331,18 @@ func (b *FilamentBridge) ImportPrusaConnectPrintHistory(printerID string, defaul
 	return summary, nil
 }
 
-func (b *FilamentBridge) printHistoryFingerprintExistsTx(tx *sql.Tx, printerName string, toolheadID int, jobName string, printStarted, printFinished time.Time) (bool, error) {
+func (b *FilamentBridge) printHistoryFingerprintExistsTx(tx *sql.Tx, printerID string, toolheadID int, jobName string, printStarted, printFinished time.Time) (bool, error) {
 	var existingID int
 	err := tx.QueryRow(`
 		SELECT id
 		FROM print_history
-		WHERE printer_name = ?
+		WHERE printer_id = ?
 		  AND toolhead_id = ?
 		  AND job_name = ?
 		  AND print_started = ?
 		  AND print_finished = ?
 		LIMIT 1
-	`, printerName, toolheadID, jobName, printStarted, printFinished).Scan(&existingID)
+	`, printerID, toolheadID, jobName, printStarted, printFinished).Scan(&existingID)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}

@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func historyIntPointer(value int) *int {
@@ -16,10 +18,12 @@ func historyIntPointer(value int) *int {
 }
 
 type historyTestSpoolmanServer struct {
-	server    *httptest.Server
-	mu        sync.Mutex
-	locations []SpoolmanLocation
-	spools    map[int]SpoolmanSpool
+	server        *httptest.Server
+	mu            sync.Mutex
+	locations     []SpoolmanLocation
+	spools        map[int]SpoolmanSpool
+	patchFailures map[int]int
+	patchCounts   map[int]int
 }
 
 func newHistoryTestSpoolmanServer() *historyTestSpoolmanServer {
@@ -31,6 +35,8 @@ func newHistoryTestSpoolmanServer() *historyTestSpoolmanServer {
 			10: {ID: 10, UsedWeight: 50, RemainingWeight: 250, Filament: &SpoolmanFilament{ColorHex: "ffffff"}, Name: "Old Spool", Brand: "Brand A", Material: "PLA"},
 			20: {ID: 20, UsedWeight: 5, RemainingWeight: 300, Filament: &SpoolmanFilament{ColorHex: "000000"}, Name: "New Spool", Brand: "Brand B", Material: "PETG"},
 		},
+		patchFailures: make(map[int]int),
+		patchCounts:   make(map[int]int),
 	}
 
 	ts.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -38,6 +44,18 @@ func newHistoryTestSpoolmanServer() *historyTestSpoolmanServer {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/location":
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(ts.locations)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/spool":
+			ts.mu.Lock()
+			spools := make([]SpoolmanSpool, 0, len(ts.spools))
+			for _, spool := range ts.spools {
+				spools = append(spools, spool)
+			}
+			ts.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(spools)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/filament":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("[]"))
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/spool/"):
 			spoolID, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/api/v1/spool/"))
 			if err != nil {
@@ -61,6 +79,16 @@ func newHistoryTestSpoolmanServer() *historyTestSpoolmanServer {
 				http.Error(w, "bad spool id", http.StatusBadRequest)
 				return
 			}
+
+			ts.mu.Lock()
+			ts.patchCounts[spoolID]++
+			if ts.patchFailures[spoolID] > 0 {
+				ts.patchFailures[spoolID]--
+				ts.mu.Unlock()
+				http.Error(w, "injected patch failure", http.StatusServiceUnavailable)
+				return
+			}
+			ts.mu.Unlock()
 
 			var payload map[string]interface{}
 			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
@@ -229,7 +257,7 @@ func TestUpdatePrintHistoryAdjustsSpoolUsageWhenWeightChanges(t *testing.T) {
 
 	bridge := newTestBridge(t, spoolman.server.URL)
 
-	if err := bridge.spoolman.AdjustSpoolUsage(20, 12.5); err != nil {
+	if err := bridge.spoolmanSnapshot().AdjustSpoolUsage(20, 12.5); err != nil {
 		t.Fatalf("AdjustSpoolUsage() error = %v", err)
 	}
 
@@ -388,7 +416,7 @@ func TestHandlePrusaLinkPrintFinishedFallsBackToDownloadedFileParse(t *testing.T
 
 	prusaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/files/usb/test.bgcode":
+		case "/api/v1/files/usb/test.gcode":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprint(w, `{"meta":{}}`)
 		case "/usb/test.bgcode":
@@ -588,16 +616,516 @@ func TestMonitorPrusaLinkUsesDisplayNameForFinishedHistory(t *testing.T) {
 	}
 }
 
+func newPrusaStateSequenceServer(t *testing.T, states []string, progress []float64, usage float64) *httptest.Server {
+	t.Helper()
+
+	var mu sync.Mutex
+	statusCall := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		index := statusCall
+		if r.URL.Path != "/api/v1/status" && statusCall > 0 {
+			index = statusCall - 1
+		}
+		if index >= len(states) {
+			index = len(states) - 1
+		}
+		if r.URL.Path == "/api/v1/status" {
+			statusCall++
+		}
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v1/status":
+			_, _ = fmt.Fprintf(w, `{"job":{"id":42,"progress":%.1f,"time_remaining":0,"time_printing":60},"printer":{"state":%q}}`, progress[index], states[index])
+		case "/api/v1/job":
+			_, _ = fmt.Fprintf(w, `{"id":42,"state":%q,"progress":%.1f,"file":{"name":"eight-tool.bgcode","display_name":"eight-tool.bgcode","path":"usb","meta":{"filament_used_g_per_tool":[%.2f]}}}`, states[index], progress[index], usage)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+
+	t.Cleanup(server.Close)
+	return server
+}
+
+func TestMonitorPrusaLinkRetainsJobAcrossIntermediateStatesAndAccountsOnce(t *testing.T) {
+	spoolman := newHistoryTestSpoolmanServer()
+	defer spoolman.close()
+
+	prusaServer := newPrusaStateSequenceServer(t,
+		[]string{StatePrinting, StatePaused, StateBusy, StateFinished, StateFinished},
+		[]float64{10, 35, 99, 100, 100},
+		12.5,
+	)
+	bridge := newTestBridge(t, spoolman.server.URL)
+	if err := bridge.SetToolheadMapping("Printer A", 0, 20); err != nil {
+		t.Fatalf("SetToolheadMapping() error = %v", err)
+	}
+	config := PrinterConfig{Name: "Printer A", IPAddress: prusaServer.URL, Toolheads: 1}
+
+	for range 5 {
+		if err := bridge.monitorPrusaLink("printer-a", config); err != nil {
+			t.Fatalf("monitorPrusaLink() error = %v", err)
+		}
+	}
+
+	if got := spoolman.usedWeight(20); got != 17.5 {
+		t.Fatalf("spool used weight = %.2f, want 17.50", got)
+	}
+	history, err := bridge.GetPrintHistory(10)
+	if err != nil {
+		t.Fatalf("GetPrintHistory() error = %v", err)
+	}
+	if len(history) != 1 {
+		t.Fatalf("history length = %d, want 1", len(history))
+	}
+	if history[0].PrintState != StateFinished {
+		t.Fatalf("print state = %q, want %q", history[0].PrintState, StateFinished)
+	}
+}
+
+func TestMonitorPrusaLinkRecordsStoppedJobWithoutDeductingUsage(t *testing.T) {
+	spoolman := newHistoryTestSpoolmanServer()
+	defer spoolman.close()
+
+	prusaServer := newPrusaStateSequenceServer(t,
+		[]string{StatePrinting, StateStopped},
+		[]float64{25, 25},
+		12.5,
+	)
+	bridge := newTestBridge(t, spoolman.server.URL)
+	if err := bridge.SetToolheadMapping("Printer A", 0, 20); err != nil {
+		t.Fatalf("SetToolheadMapping() error = %v", err)
+	}
+	config := PrinterConfig{Name: "Printer A", IPAddress: prusaServer.URL, Toolheads: 1}
+
+	for range 2 {
+		if err := bridge.monitorPrusaLink("printer-a", config); err != nil {
+			t.Fatalf("monitorPrusaLink() error = %v", err)
+		}
+	}
+
+	if got := spoolman.usedWeight(20); got != 5 {
+		t.Fatalf("spool used weight = %.2f, want unchanged 5.00", got)
+	}
+	history, err := bridge.GetPrintHistory(10)
+	if err != nil {
+		t.Fatalf("GetPrintHistory() error = %v", err)
+	}
+	if len(history) != 1 || history[0].PrintState != StateStopped || history[0].FilamentUsed != 0 {
+		t.Fatalf("stopped history = %+v, want one zero-usage STOPPED entry", history)
+	}
+}
+
+func TestMonitorPrusaLinkRestoresActiveJobAfterRestart(t *testing.T) {
+	spoolman := newHistoryTestSpoolmanServer()
+	defer spoolman.close()
+
+	prusaServer := newPrusaStateSequenceServer(t,
+		[]string{StatePrinting, StateFinished},
+		[]float64{50, 100},
+		12.5,
+	)
+	dbPath := filepath.Join(t.TempDir(), "filabridge.db")
+	config := &Config{DBFile: dbPath, SpoolmanURL: spoolman.server.URL, SpoolmanTimeout: 5}
+	printer := PrinterConfig{Name: "Printer A", IPAddress: prusaServer.URL, Toolheads: 1}
+
+	first, err := NewFilamentBridge(config)
+	if err != nil {
+		t.Fatalf("NewFilamentBridge(first) error = %v", err)
+	}
+	if err := first.SavePrinterConfig("printer-a", printer); err != nil {
+		t.Fatalf("SavePrinterConfig() error = %v", err)
+	}
+	if err := first.SetToolheadMapping("Printer A", 0, 20); err != nil {
+		t.Fatalf("SetToolheadMapping() error = %v", err)
+	}
+	if err := first.monitorPrusaLink("printer-a", printer); err != nil {
+		t.Fatalf("first monitorPrusaLink() error = %v", err)
+	}
+	if err := first.db.Close(); err != nil {
+		t.Fatalf("first database close error = %v", err)
+	}
+
+	second, err := NewFilamentBridge(config)
+	if err != nil {
+		t.Fatalf("NewFilamentBridge(second) error = %v", err)
+	}
+	t.Cleanup(func() { _ = second.db.Close() })
+	if err := second.monitorPrusaLink("printer-a", printer); err != nil {
+		t.Fatalf("second monitorPrusaLink() error = %v", err)
+	}
+
+	if got := spoolman.usedWeight(20); got != 17.5 {
+		t.Fatalf("spool used weight = %.2f, want 17.50", got)
+	}
+	history, err := second.GetPrintHistory(10)
+	if err != nil {
+		t.Fatalf("GetPrintHistory() error = %v", err)
+	}
+	if len(history) != 1 || history[0].PrintState != StateFinished {
+		t.Fatalf("restored history = %+v, want one FINISHED entry", history)
+	}
+}
+
+func TestMonitorPrusaLinkCompletesReadyJobUsingPersistedProgress(t *testing.T) {
+	spoolman := newHistoryTestSpoolmanServer()
+	defer spoolman.close()
+
+	prusaServer := newPrusaStateSequenceServer(t,
+		[]string{StatePrinting, StateReady},
+		[]float64{100, 0},
+		12.5,
+	)
+	bridge := newTestBridge(t, spoolman.server.URL)
+	if err := bridge.SetToolheadMapping("Printer A", 0, 20); err != nil {
+		t.Fatalf("SetToolheadMapping() error = %v", err)
+	}
+	config := PrinterConfig{Name: "Printer A", IPAddress: prusaServer.URL, Toolheads: 1}
+
+	for range 2 {
+		if err := bridge.monitorPrusaLink("printer-a", config); err != nil {
+			t.Fatalf("monitorPrusaLink() error = %v", err)
+		}
+	}
+
+	if got := spoolman.usedWeight(20); got != 17.5 {
+		t.Fatalf("spool used weight = %.2f, want 17.50", got)
+	}
+}
+
+func TestDurableMultiToolRetryDoesNotDebitCompletedToolTwice(t *testing.T) {
+	spoolman := newHistoryTestSpoolmanServer()
+	defer spoolman.close()
+	spoolman.mu.Lock()
+	spoolman.patchFailures[20] = 1
+	spoolman.mu.Unlock()
+
+	bridge := newTestBridge(t, spoolman.server.URL)
+	if err := bridge.SetToolheadMapping("Printer A", 0, 10); err != nil {
+		t.Fatalf("SetToolheadMapping(tool 0) error = %v", err)
+	}
+	if err := bridge.SetToolheadMapping("Printer A", 1, 20); err != nil {
+		t.Fatalf("SetToolheadMapping(tool 1) error = %v", err)
+	}
+	config := PrinterConfig{Name: "Printer A", IPAddress: "printer.local", Toolheads: 2}
+	usage := map[int]float64{0: 2, 1: 3}
+	if err := bridge.saveActiveJobCheckpoint("printer-a", config, 42, "usb/multi.bgcode", "multi.bgcode", usage, StatePrinting, 100); err != nil {
+		t.Fatalf("saveActiveJobCheckpoint() error = %v", err)
+	}
+	checkpoint, err := bridge.loadPrinterJobCheckpoint("printer-a")
+	if err != nil || checkpoint == nil {
+		t.Fatalf("loadPrinterJobCheckpoint() = %#v, %v", checkpoint, err)
+	}
+
+	if err := bridge.finishCheckpoint(checkpoint, config, checkpoint.SourcePath, checkpoint.JobName, usage, StateFinished); err == nil {
+		t.Fatal("first finishCheckpoint() succeeded, want injected second-tool failure")
+	}
+	if got := spoolman.usedWeight(10); got != 52 {
+		t.Fatalf("first spool used weight = %.2f, want 52.00 after first attempt", got)
+	}
+	if got := spoolman.usedWeight(20); got != 5 {
+		t.Fatalf("second spool used weight = %.2f, want 5.00 after failed first attempt", got)
+	}
+
+	checkpoint, err = bridge.loadPrinterJobCheckpoint("printer-a")
+	if err != nil || checkpoint == nil {
+		t.Fatalf("reload checkpoint = %#v, %v", checkpoint, err)
+	}
+	if err := bridge.finishCheckpoint(checkpoint, config, checkpoint.SourcePath, checkpoint.JobName, usage, StateFinished); err != nil {
+		t.Fatalf("retry finishCheckpoint() error = %v", err)
+	}
+	if got := spoolman.usedWeight(10); got != 52 {
+		t.Fatalf("first spool was debited twice: %.2f, want 52.00", got)
+	}
+	if got := spoolman.usedWeight(20); got != 8 {
+		t.Fatalf("second spool used weight = %.2f, want 8.00", got)
+	}
+	spoolman.mu.Lock()
+	firstToolPatches := spoolman.patchCounts[10]
+	spoolman.mu.Unlock()
+	if firstToolPatches != 1 {
+		t.Fatalf("first spool patch count = %d, want exactly 1", firstToolPatches)
+	}
+	history, err := bridge.GetPrintHistory(10)
+	if err != nil {
+		t.Fatalf("GetPrintHistory() error = %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history length = %d, want one row per tool", len(history))
+	}
+}
+
+func TestUnresolvedCheckpointCannotBeOverwrittenByNextJob(t *testing.T) {
+	spoolman := newHistoryTestSpoolmanServer()
+	defer spoolman.close()
+	bridge := newTestBridge(t, spoolman.server.URL)
+	config := PrinterConfig{Name: "Printer A", IPAddress: "printer.local", Toolheads: 1}
+	if err := bridge.saveActiveJobCheckpoint("printer-a", config, 1, "usb/first.bgcode", "first.bgcode", map[int]float64{0: 5}, StatePrinting, 75); err != nil {
+		t.Fatalf("save first checkpoint: %v", err)
+	}
+	if err := bridge.saveActiveJobCheckpoint("printer-a", config, 2, "usb/second.bgcode", "second.bgcode", map[int]float64{0: 3}, StatePrinting, 10); err == nil {
+		t.Fatal("save second checkpoint succeeded while first remained unresolved")
+	}
+	checkpoint, err := bridge.loadPrinterJobCheckpoint("printer-a")
+	if err != nil || checkpoint == nil {
+		t.Fatalf("load checkpoint = %#v, %v", checkpoint, err)
+	}
+	if checkpoint.PrusaLinkJobID != 1 || checkpoint.SourcePath != "usb/first.bgcode" {
+		t.Fatalf("unresolved checkpoint was overwritten: %#v", checkpoint)
+	}
+}
+
+func TestRestartReclaimsInterruptedProcessingCheckpoint(t *testing.T) {
+	spoolman := newHistoryTestSpoolmanServer()
+	defer spoolman.close()
+	dbPath := filepath.Join(t.TempDir(), "filabridge.db")
+	config := &Config{DBFile: dbPath, SpoolmanURL: spoolman.server.URL, SpoolmanTimeout: 5}
+	printer := PrinterConfig{Name: "Printer A", IPAddress: "printer.local", Toolheads: 1}
+
+	first, err := NewFilamentBridge(config)
+	if err != nil {
+		t.Fatalf("NewFilamentBridge(first) error = %v", err)
+	}
+	if err := first.SavePrinterConfig("printer-a", printer); err != nil {
+		t.Fatalf("SavePrinterConfig() error = %v", err)
+	}
+	if err := first.SetToolheadMapping("Printer A", 0, 20); err != nil {
+		t.Fatalf("SetToolheadMapping() error = %v", err)
+	}
+	usage := map[int]float64{0: 12.5}
+	if err := first.saveActiveJobCheckpoint("printer-a", printer, 42, "usb/restart.bgcode", "restart.bgcode", usage, StatePrinting, 100); err != nil {
+		t.Fatalf("saveActiveJobCheckpoint() error = %v", err)
+	}
+	checkpoint, err := first.loadPrinterJobCheckpoint("printer-a")
+	if err != nil || checkpoint == nil {
+		t.Fatalf("load checkpoint = %#v, %v", checkpoint, err)
+	}
+	if acquired, err := first.acquireCheckpoint(checkpoint); err != nil || !acquired {
+		t.Fatalf("acquireCheckpoint() = %v, %v", acquired, err)
+	}
+	if _, err := first.db.Exec(`UPDATE printer_job_checkpoints SET accounting_lease_until = ? WHERE printer_id = ?`, time.Now().Add(-time.Minute).Unix(), "printer-a"); err != nil {
+		t.Fatalf("expire accounting lease: %v", err)
+	}
+	if err := first.db.Close(); err != nil {
+		t.Fatalf("close first database: %v", err)
+	}
+
+	second, err := NewFilamentBridge(config)
+	if err != nil {
+		t.Fatalf("NewFilamentBridge(second) error = %v", err)
+	}
+	t.Cleanup(func() { _ = second.db.Close() })
+	checkpoint, err = second.loadPrinterJobCheckpoint("printer-a")
+	if err != nil || checkpoint == nil {
+		t.Fatalf("reload checkpoint = %#v, %v", checkpoint, err)
+	}
+	if err := second.finishCheckpoint(checkpoint, printer, checkpoint.SourcePath, checkpoint.JobName, usage, StateFinished); err != nil {
+		t.Fatalf("finishCheckpoint() after restart error = %v", err)
+	}
+	if got := spoolman.usedWeight(20); got != 17.5 {
+		t.Fatalf("spool used weight = %.2f, want 17.50", got)
+	}
+	history, err := second.GetPrintHistory(10)
+	if err != nil || len(history) != 1 {
+		t.Fatalf("history = %#v, %v; want one row", history, err)
+	}
+}
+
+func TestAmbiguousReadyJobRequiresExplicitResolution(t *testing.T) {
+	spoolman := newHistoryTestSpoolmanServer()
+	defer spoolman.close()
+	bridge := newTestBridge(t, spoolman.server.URL)
+	printer := PrinterConfig{Name: "Printer A", Model: "MK4S", IPAddress: "printer.local", Toolheads: 1}
+	if err := bridge.SavePrinterConfig("printer-a", printer); err != nil {
+		t.Fatalf("SavePrinterConfig() error = %v", err)
+	}
+	usage := map[int]float64{0: 12.5}
+	if err := bridge.saveActiveJobCheckpoint("printer-a", printer, 42, "usb/ambiguous.bgcode", "ambiguous.bgcode", usage, StatePrinting, 80); err != nil {
+		t.Fatalf("saveActiveJobCheckpoint() error = %v", err)
+	}
+	status := &PrusaLinkStatus{}
+	status.Printer.State = StateReady
+	if err := bridge.reconcilePrusaLinkJob("printer-a", printer, status, nil, "", "", nil); err != nil {
+		t.Fatalf("reconcilePrusaLinkJob() error = %v", err)
+	}
+	checkpoint, err := bridge.loadPrinterJobCheckpoint("printer-a")
+	if err != nil || checkpoint == nil {
+		t.Fatalf("checkpoint = %#v, %v", checkpoint, err)
+	}
+	if checkpoint.AccountingStatus != jobAccountingAttention {
+		t.Fatalf("accounting status = %q, want %q", checkpoint.AccountingStatus, jobAccountingAttention)
+	}
+	if err := bridge.resolvePrinterJobCheckpoint("printer-a", StateStopped); err != nil {
+		t.Fatalf("resolvePrinterJobCheckpoint() error = %v", err)
+	}
+	history, err := bridge.GetPrintHistory(10)
+	if err != nil || len(history) != 1 || history[0].PrintState != StateStopped || history[0].FilamentUsed != 0 {
+		t.Fatalf("history = %#v, %v; want explicit STOPPED resolution", history, err)
+	}
+}
+
+func TestStatusOnlyTransientStateDoesNotBlockNextRealJob(t *testing.T) {
+	for _, transientState := range []string{StateBusy, StateAttention} {
+		t.Run(transientState, func(t *testing.T) {
+			spoolman := newHistoryTestSpoolmanServer()
+			defer spoolman.close()
+			bridge := newTestBridge(t, spoolman.server.URL)
+			printer := PrinterConfig{Name: "Printer A", Model: "MK4S", IPAddress: "printer.local", Toolheads: 1}
+			if err := bridge.SavePrinterConfig("printer-a", printer); err != nil {
+				t.Fatalf("SavePrinterConfig() error = %v", err)
+			}
+			if err := bridge.SetToolheadMapping("printer-a", 0, 20); err != nil {
+				t.Fatalf("SetToolheadMapping() error = %v", err)
+			}
+
+			transient := &PrusaLinkStatus{}
+			transient.Printer.State = transientState
+			if err := bridge.reconcilePrusaLinkJob("printer-a", printer, transient, &PrusaLinkJob{}, "", "", nil); err != nil {
+				t.Fatalf("reconcile status-only %s error = %v", transientState, err)
+			}
+			checkpoint, err := bridge.loadPrinterJobCheckpoint("printer-a")
+			if err != nil {
+				t.Fatalf("load checkpoint after status-only %s: %v", transientState, err)
+			}
+			if checkpoint != nil {
+				t.Fatalf("status-only %s created checkpoint = %#v", transientState, checkpoint)
+			}
+
+			active := &PrusaLinkStatus{}
+			active.Printer.State = StatePrinting
+			active.Job.ID = 42
+			active.Job.Progress = 25
+			job := &PrusaLinkJob{ID: 42, State: StatePrinting}
+			job.File.Path = "usb"
+			job.File.Name = "real-job.bgcode"
+			usage := map[int]float64{0: 12.5}
+			if err := bridge.reconcilePrusaLinkJob("printer-a", printer, active, job, "usb/real-job.bgcode", "real-job.bgcode", usage); err != nil {
+				t.Fatalf("reconcile real active job after %s error = %v", transientState, err)
+			}
+
+			finished := &PrusaLinkStatus{}
+			finished.Printer.State = StateFinished
+			finished.Job.ID = 42
+			finished.Job.Progress = 100
+			job.State = StateFinished
+			if err := bridge.reconcilePrusaLinkJob("printer-a", printer, finished, job, "usb/real-job.bgcode", "real-job.bgcode", usage); err != nil {
+				t.Fatalf("finish real job after %s error = %v", transientState, err)
+			}
+			if got := spoolman.usedWeight(20); got != 17.5 {
+				t.Fatalf("spool used weight after %s = %.2f, want 17.50", transientState, got)
+			}
+			history, err := bridge.GetPrintHistory(10)
+			if err != nil || len(history) != 1 || history[0].JobName != "real-job.bgcode" {
+				t.Fatalf("history after %s = %#v, err=%v; want one real job", transientState, history, err)
+			}
+		})
+	}
+}
+
+func TestTerminalEventForDifferentJobDoesNotFinalizeCheckpoint(t *testing.T) {
+	spoolman := newHistoryTestSpoolmanServer()
+	defer spoolman.close()
+	bridge := newTestBridge(t, spoolman.server.URL)
+	printer := PrinterConfig{Name: "Printer A", IPAddress: "printer.local", Toolheads: 1}
+	if err := bridge.SetToolheadMapping("Printer A", 0, 20); err != nil {
+		t.Fatalf("SetToolheadMapping() error = %v", err)
+	}
+	if err := bridge.saveActiveJobCheckpoint("printer-a", printer, 1, "usb/first.bgcode", "first.bgcode", map[int]float64{0: 5}, StatePrinting, 80); err != nil {
+		t.Fatalf("saveActiveJobCheckpoint() error = %v", err)
+	}
+	status := &PrusaLinkStatus{}
+	status.Printer.State = StateFinished
+	status.Job.ID = 2
+	job := &PrusaLinkJob{ID: 2, State: StateFinished}
+	job.File.Path = "usb"
+	job.File.Name = "second.bgcode"
+	if err := bridge.reconcilePrusaLinkJob("printer-a", printer, status, job, "usb/second.bgcode", "second.bgcode", map[int]float64{0: 10}); err != nil {
+		t.Fatalf("reconcilePrusaLinkJob() error = %v", err)
+	}
+	checkpoint, err := bridge.loadPrinterJobCheckpoint("printer-a")
+	if err != nil || checkpoint == nil {
+		t.Fatalf("checkpoint = %#v, %v", checkpoint, err)
+	}
+	if checkpoint.PrusaLinkJobID != 1 || checkpoint.AccountingStatus != jobAccountingAttention {
+		t.Fatalf("checkpoint = %#v, want original job in attention", checkpoint)
+	}
+	if got := spoolman.usedWeight(20); got != 5 {
+		t.Fatalf("spool used weight = %.2f, want unchanged 5.00", got)
+	}
+}
+
+func TestLiveAccountingLeaseRejectsStaleWriterAndFencesExpiredOwner(t *testing.T) {
+	spoolman := newHistoryTestSpoolmanServer()
+	defer spoolman.close()
+	dbPath := filepath.Join(t.TempDir(), "filabridge.db")
+	config := &Config{DBFile: dbPath, SpoolmanURL: spoolman.server.URL, SpoolmanTimeout: 5}
+	first, err := NewFilamentBridge(config)
+	if err != nil {
+		t.Fatalf("NewFilamentBridge(first) error = %v", err)
+	}
+	defer first.Close()
+	second, err := NewFilamentBridge(config)
+	if err != nil {
+		t.Fatalf("NewFilamentBridge(second) error = %v", err)
+	}
+	defer second.Close()
+	printer := PrinterConfig{Name: "Printer A", IPAddress: "printer.local", Toolheads: 1}
+	if err := first.SavePrinterConfig("printer-a", printer); err != nil {
+		t.Fatalf("SavePrinterConfig() error = %v", err)
+	}
+	if err := first.saveActiveJobCheckpoint("printer-a", printer, 42, "usb/lease.bgcode", "lease.bgcode", map[int]float64{0: 5}, StatePrinting, 50); err != nil {
+		t.Fatalf("saveActiveJobCheckpoint() error = %v", err)
+	}
+	stale, err := second.loadPrinterJobCheckpoint("printer-a")
+	if err != nil || stale == nil {
+		t.Fatalf("load stale checkpoint = %#v, %v", stale, err)
+	}
+	owned, err := first.loadPrinterJobCheckpoint("printer-a")
+	if err != nil || owned == nil {
+		t.Fatalf("load owned checkpoint = %#v, %v", owned, err)
+	}
+	if acquired, err := first.acquireCheckpoint(owned); err != nil || !acquired {
+		t.Fatalf("first acquireCheckpoint() = %v, %v", acquired, err)
+	}
+	stale.Progress = 60
+	if err := second.upsertPrinterJobCheckpoint(stale); err != nil {
+		t.Fatalf("stale upsert error = %v", err)
+	}
+	var status, owner string
+	if err := first.db.QueryRow(`SELECT accounting_status, accounting_owner FROM printer_job_checkpoints WHERE printer_id = ?`, "printer-a").Scan(&status, &owner); err != nil {
+		t.Fatalf("inspect lease: %v", err)
+	}
+	if status != jobAccountingProcessing || owner != first.instanceID {
+		t.Fatalf("lease changed by stale writer: status=%q owner=%q", status, owner)
+	}
+	if _, err := first.db.Exec(`UPDATE printer_job_checkpoints SET accounting_lease_until = ? WHERE printer_id = ?`, time.Now().Add(-time.Minute).Unix(), "printer-a"); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+	reclaimed, err := second.loadPrinterJobCheckpoint("printer-a")
+	if err != nil || reclaimed == nil {
+		t.Fatalf("load reclaim checkpoint = %#v, %v", reclaimed, err)
+	}
+	if acquired, err := second.acquireCheckpoint(reclaimed); err != nil || !acquired {
+		t.Fatalf("second acquireCheckpoint() = %v, %v", acquired, err)
+	}
+	if err := first.renewCheckpointLease(owned); err == nil {
+		t.Fatal("expired owner renewed lease after another process reclaimed it")
+	}
+}
+
 func TestRefreshPrintHistoryFilamentUsageUsesStoredSourcePath(t *testing.T) {
 	spoolman := newHistoryTestSpoolmanServer()
 	defer spoolman.close()
 
 	prusaServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/v1/files/usb/test.bgcode":
+		case "/api/v1/files/usb/test.gcode":
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprint(w, `{"meta":{},"refs":{"download":"/api/files/usb/test.bgcode/raw"}}`)
-		case "/api/files/usb/test.bgcode/raw":
+			_, _ = fmt.Fprint(w, `{"meta":{},"refs":{"download":"/api/files/usb/test.gcode/raw"}}`)
+		case "/api/files/usb/test.gcode/raw":
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.WriteHeader(http.StatusPartialContent)
 			_, _ = w.Write([]byte("junk\nfilament used [g]=29.19\n"))
@@ -618,10 +1146,10 @@ func TestRefreshPrintHistoryFilamentUsageUsesStoredSourcePath(t *testing.T) {
 		t.Fatalf("SavePrinterConfig() error = %v", err)
 	}
 
-	if err := bridge.spoolman.AdjustSpoolUsage(20, 12.5); err != nil {
+	if err := bridge.spoolmanSnapshot().AdjustSpoolUsage(20, 12.5); err != nil {
 		t.Fatalf("AdjustSpoolUsage() error = %v", err)
 	}
-	if err := bridge.LogPrintUsageWithSourcePath("Printer A", 0, historyIntPointer(20), 12.5, "test.bgcode", "usb/test.bgcode"); err != nil {
+	if err := bridge.LogPrintUsageWithSourcePath("Printer A", 0, historyIntPointer(20), 12.5, "test.gcode", "usb/test.gcode"); err != nil {
 		t.Fatalf("LogPrintUsageWithSourcePath() error = %v", err)
 	}
 
@@ -637,8 +1165,8 @@ func TestRefreshPrintHistoryFilamentUsageUsesStoredSourcePath(t *testing.T) {
 	if updatedEntry.FilamentUsed != 29.19 {
 		t.Fatalf("updated filament used = %.2f, want 29.19", updatedEntry.FilamentUsed)
 	}
-	if updatedEntry.SourcePath != "usb/test.bgcode" {
-		t.Fatalf("updated source path = %q, want %q", updatedEntry.SourcePath, "usb/test.bgcode")
+	if updatedEntry.SourcePath != "usb/test.gcode" {
+		t.Fatalf("updated source path = %q, want %q", updatedEntry.SourcePath, "usb/test.gcode")
 	}
 	if got := spoolman.usedWeight(20); got != 34.19 {
 		t.Fatalf("spool used weight = %.2f, want 34.19", got)

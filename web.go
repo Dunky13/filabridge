@@ -10,8 +10,10 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	neturl "net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,6 +35,7 @@ var staticFS embed.FS
 type WebServer struct {
 	bridge         *FilamentBridge
 	router         *gin.Engine
+	managementHost string
 	operationMutex sync.Mutex // Protects add/update/delete printer operations
 	wsHub          *WebSocketHub
 }
@@ -43,7 +46,9 @@ type WebSocketHub struct {
 	register   chan *WebSocketClient
 	unregister chan *WebSocketClient
 	broadcast  chan []byte
-	mutex      sync.RWMutex
+	stop       chan struct{}
+	done       chan struct{}
+	stopOnce   sync.Once
 }
 
 // WebSocketClient represents a WebSocket connection
@@ -65,12 +70,19 @@ type WebSocketMessage struct {
 
 // NewWebServer creates a new web server with Gin
 func NewWebServer(bridge *FilamentBridge) *WebServer {
+	return NewWebServerForHost(bridge, "127.0.0.1")
+}
+
+// NewWebServerForHost binds management access policy to the actual listener
+// host. Callers that expose FilaBridge beyond loopback must pass that host.
+func NewWebServerForHost(bridge *FilamentBridge, host string) *WebServer {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 
 	// Add middleware
 	router.Use(gin.Logger())
 	router.Use(gin.Recovery())
+	router.Use(securityHeadersMiddleware())
 
 	// Add custom recovery middleware for API routes to ensure JSON responses
 	router.Use(func(c *gin.Context) {
@@ -90,24 +102,30 @@ func NewWebServer(bridge *FilamentBridge) *WebServer {
 	})
 
 	// Create WebSocket hub
-	wsHub := &WebSocketHub{
-		clients:    make(map[*WebSocketClient]bool),
-		register:   make(chan *WebSocketClient),
-		unregister: make(chan *WebSocketClient),
-		broadcast:  make(chan []byte),
-	}
+	wsHub := newWebSocketHub()
 
 	ws := &WebServer{
-		bridge: bridge,
-		router: router,
-		wsHub:  wsHub,
+		bridge:         bridge,
+		router:         router,
+		managementHost: host,
+		wsHub:          wsHub,
 	}
-
-	// Start WebSocket hub
-	go wsHub.run()
 
 	ws.setupRoutes()
 	return ws
+}
+
+func newWebSocketHub() *WebSocketHub {
+	hub := &WebSocketHub{
+		clients:    make(map[*WebSocketClient]bool),
+		register:   make(chan *WebSocketClient),
+		unregister: make(chan *WebSocketClient),
+		broadcast:  make(chan []byte, 1),
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
+	}
+	go hub.run()
+	return hub
 }
 
 // generateToolheadIDs generates a slice of toolhead IDs from 0 to count-1
@@ -137,50 +155,136 @@ func (ws *WebServer) setupRoutes() {
 	}
 	ws.router.StaticFS("/static", http.FS(staticSubFS))
 
+	// Process readiness only. Keep this route independent from printers,
+	// Spoolman, SQLite queries, and management credentials.
+	ws.router.GET("/healthz", healthzHandler)
+
 	// Main dashboard
-	ws.router.GET("/", ws.dashboardHandler)
+	ws.router.GET("/", managementAccessMiddleware(ws.managementHost), ws.dashboardHandler)
 
 	// API routes
 	api := ws.router.Group("/api")
+
+	// Status, inventory, configuration, and every state-changing operation share
+	// one authenticated management seam.
+	management := api.Group("")
+	management.Use(managementAccessMiddleware(ws.managementHost), managementOriginMiddleware())
 	{
-		api.GET("/status", ws.statusHandler)
-		api.GET("/spools", ws.spoolsHandler)
-		api.GET("/print-history", ws.getPrintHistoryHandler)
-		api.POST("/print-history/import", ws.importPrintHistoryHandler)
-		api.PUT("/print-history/:id", ws.updatePrintHistoryHandler)
-		api.PUT("/print-history/:id/spool", ws.updatePrintHistoryHandler)
-		api.POST("/print-history/:id/pull", ws.pullPrintHistoryHandler)
-		api.GET("/filaments", ws.filamentsHandler)
-		api.POST("/map_toolhead", ws.mapToolheadHandler)
-		api.GET("/available_spools", ws.availableSpoolsHandler)
-		api.GET("/spoolman/test", ws.testSpoolmanConnectionHandler)
-		api.GET("/spoolman/debug", ws.debugSpoolmanHandler)
-		api.POST("/test/print_complete", ws.testPrintCompleteHandler)
-		api.GET("/config", ws.getConfigHandler)
-		api.POST("/config", ws.updateConfigHandler)
-		api.GET("/config/auto-assign-previous-spool", ws.getAutoAssignPreviousSpoolHandler)
-		api.PUT("/config/auto-assign-previous-spool", ws.updateAutoAssignPreviousSpoolHandler)
-		api.GET("/printers", ws.getPrintersHandler)
-		api.POST("/printers", ws.addPrinterHandler)
-		api.PUT("/printers/:id", ws.updatePrinterHandler)
-		api.DELETE("/printers/:id", ws.deletePrinterHandler)
-		api.GET("/printers/:id/toolheads", ws.getToolheadNamesHandler)
-		api.PUT("/printers/:id/toolheads/:toolhead_id", ws.updateToolheadNameHandler)
-		api.POST("/detect_printer", ws.detectPrinterHandler)
-		api.GET("/print-errors", ws.getPrintErrorsHandler)
-		api.POST("/print-errors/:id/acknowledge", ws.acknowledgePrintErrorHandler)
-		api.GET("/nfc/assign", ws.nfcAssignHandler)
-		api.GET("/nfc/urls", ws.nfcUrlsHandler)
-		api.GET("/nfc/session/status", ws.nfcSessionStatusHandler)
-		api.GET("/locations", ws.getLocationsHandler)
-		api.GET("/locations/:name/status", ws.getLocationStatusHandler)
-		api.POST("/locations", ws.createLocationHandler)
-		api.PUT("/locations/:name", ws.updateLocationHandler)
-		api.DELETE("/locations/:name", ws.deleteLocationHandler)
+		management.GET("/status", ws.statusHandler)
+		management.GET("/spools", ws.spoolsHandler)
+		management.GET("/print-history", ws.getPrintHistoryHandler)
+		management.POST("/print-history/import", ws.importPrintHistoryHandler)
+		management.PUT("/print-history/:id", ws.updatePrintHistoryHandler)
+		management.PUT("/print-history/:id/spool", ws.updatePrintHistoryHandler)
+		management.POST("/print-history/:id/pull", ws.pullPrintHistoryHandler)
+		management.GET("/filaments", ws.filamentsHandler)
+		management.POST("/map_toolhead", ws.mapToolheadHandler)
+		management.GET("/available_spools", ws.availableSpoolsHandler)
+		management.GET("/spoolman/test", ws.testSpoolmanConnectionHandler)
+		management.GET("/spoolman/debug", ws.debugSpoolmanHandler)
+		management.GET("/spoolman/capabilities", ws.spoolmanCapabilitiesHandler)
+		management.GET("/spoolman/tags/:uid", ws.lookupSpoolmanTagHandler)
+		management.POST("/spools/:id/tags", ws.associateSpoolmanTagHandler)
+		management.GET("/spools/:id/consumption-authority", ws.getSpoolConsumptionAuthorityHandler)
+		management.PUT("/spools/:id/consumption-authority", ws.updateSpoolConsumptionAuthorityHandler)
+		management.GET("/config", ws.getConfigHandler)
+		management.POST("/config", ws.updateConfigHandler)
+		management.GET("/config/auto-assign-previous-spool", ws.getAutoAssignPreviousSpoolHandler)
+		management.PUT("/config/auto-assign-previous-spool", ws.updateAutoAssignPreviousSpoolHandler)
+		management.GET("/printers", ws.getPrintersHandler)
+		management.GET("/printer-presets", ws.printerPresetsHandler)
+		management.GET("/prusaslicer/profiles.zip", requiredProfileExportAuthMiddleware(), ws.prusaSlicerProfilesHandler)
+		management.POST("/printers", ws.addPrinterHandler)
+		management.PUT("/printers/:id", ws.updatePrinterHandler)
+		management.DELETE("/printers/:id", ws.deletePrinterHandler)
+		management.GET("/printers/:id/toolheads", ws.getToolheadNamesHandler)
+		management.PUT("/printers/:id/toolheads/:toolhead_id", ws.updateToolheadNameHandler)
+		management.GET("/printers/:id/tool-routes", ws.getLogicalToolRoutesHandler)
+		management.PUT("/printers/:id/tool-routes/:logical_tool_id", ws.updateLogicalToolRouteHandler)
+		management.DELETE("/printers/:id/tool-routes/:logical_tool_id", ws.resetLogicalToolRouteHandler)
+		management.GET("/printers/:id/prusalink-diagnostics", ws.prusaLinkDiagnosticsHandler)
+		management.GET("/printers/:id/job-reconciliation", ws.getJobReconciliationHandler)
+		management.POST("/printers/:id/job-reconciliation/resolve", ws.resolveJobReconciliationHandler)
+		management.POST("/detect_printer", ws.detectPrinterHandler)
+		management.GET("/print-errors", ws.getPrintErrorsHandler)
+		management.POST("/print-errors/:id/acknowledge", ws.acknowledgePrintErrorHandler)
+		management.GET("/nfc/assign", ws.nfcAssignConfirmationHandler)
+		management.POST("/nfc/assign", ws.nfcAssignHandler)
+		management.GET("/nfc/urls", ws.nfcUrlsHandler)
+		management.GET("/nfc/session/status", ws.nfcSessionStatusHandler)
+		management.GET("/locations", ws.getLocationsHandler)
+		management.GET("/locations/:name/status", ws.getLocationStatusHandler)
+		management.POST("/locations", ws.createLocationHandler)
+		management.PUT("/locations/:name", ws.updateLocationHandler)
+		management.DELETE("/locations/:name", ws.deleteLocationHandler)
 	}
 
 	// WebSocket endpoint
-	ws.router.GET("/ws/status", ws.websocketHandler)
+	ws.router.GET("/ws/status", managementAccessMiddleware(ws.managementHost), ws.websocketHandler)
+}
+
+func healthzHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func securityHeadersMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'")
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("Referrer-Policy", "no-referrer")
+		c.Header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		c.Next()
+	}
+}
+
+func managementAccessMiddleware(host string) gin.HandlerFunc {
+	username := os.Getenv("FILABRIDGE_WEB_USERNAME")
+	password := os.Getenv("FILABRIDGE_WEB_PASSWORD")
+
+	if username == "" && password == "" && isLoopbackHost(host) {
+		return func(c *gin.Context) { c.Next() }
+	}
+	if username == "" || password == "" {
+		return func(c *gin.Context) {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
+				"error": "management authentication is required for non-loopback access",
+			})
+		}
+	}
+
+	// Gin owns parsing and constant-time verification of Basic credentials.
+	return gin.BasicAuth(gin.Accounts{username: password})
+}
+
+func managementOriginMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		switch c.Request.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+			c.Next()
+			return
+		}
+
+		fetchSite := strings.ToLower(strings.TrimSpace(c.GetHeader("Sec-Fetch-Site")))
+		if fetchSite == "cross-site" || fetchSite == "same-site" {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "cross-origin management request rejected"})
+			return
+		}
+		if origin := strings.TrimSpace(c.GetHeader("Origin")); origin != "" && !requestOriginMatches(c.Request, origin) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "cross-origin management request rejected"})
+			return
+		}
+		c.Next()
+	}
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func formatDurationSeconds(seconds int) string {
@@ -221,36 +325,84 @@ func formatETASeconds(seconds int) string {
 
 // run starts the WebSocket hub
 func (h *WebSocketHub) run() {
+	defer close(h.done)
 	for {
 		select {
 		case client := <-h.register:
-			h.mutex.Lock()
 			h.clients[client] = true
-			h.mutex.Unlock()
 			log.Printf("WebSocket client connected. Total clients: %d", len(h.clients))
 
 		case client := <-h.unregister:
-			h.mutex.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
-				close(client.send)
-			}
-			h.mutex.Unlock()
+			h.removeOwnedClient(client)
 			log.Printf("WebSocket client disconnected. Total clients: %d", len(h.clients))
 
 		case message := <-h.broadcast:
-			h.mutex.RLock()
 			for client := range h.clients {
 				select {
 				case client.send <- message:
 				default:
-					close(client.send)
-					delete(h.clients, client)
+					h.removeOwnedClient(client)
 				}
 			}
-			h.mutex.RUnlock()
+
+		case <-h.stop:
+			for client := range h.clients {
+				h.removeOwnedClient(client)
+			}
+			return
 		}
 	}
+}
+
+func (h *WebSocketHub) removeOwnedClient(client *WebSocketClient) {
+	if _, exists := h.clients[client]; !exists {
+		return
+	}
+	delete(h.clients, client)
+	close(client.send)
+	if client.conn != nil {
+		_ = client.conn.Close()
+	}
+}
+
+func (h *WebSocketHub) registerClient(client *WebSocketClient) bool {
+	select {
+	case h.register <- client:
+		return true
+	case <-h.done:
+		return false
+	}
+}
+
+func (h *WebSocketHub) unregisterClient(client *WebSocketClient) {
+	select {
+	case h.unregister <- client:
+	case <-h.done:
+	}
+}
+
+func (h *WebSocketHub) publish(message []byte) bool {
+	select {
+	case h.broadcast <- message:
+		return true
+	case <-h.done:
+		return false
+	default:
+		return false
+	}
+}
+
+func (h *WebSocketHub) Stop() {
+	h.stopOnce.Do(func() { close(h.stop) })
+	<-h.done
+}
+
+// Shutdown terminates the hub and closes every active WebSocket connection.
+func (ws *WebServer) Shutdown() {
+	if ws == nil || ws.wsHub == nil {
+		return
+	}
+	ws.wsHub.Stop()
 }
 
 // BroadcastStatus sends status updates to all connected clients
@@ -263,7 +415,7 @@ func (ws *WebServer) BroadcastStatus() {
 	}
 
 	// Get current spools
-	spools, err := ws.bridge.spoolman.GetAllSpools()
+	spools, err := ws.bridge.spoolmanSnapshot().GetAllSpools()
 	if err != nil {
 		log.Printf("Error getting spools for broadcast: %v", err)
 		spools = []SpoolmanSpool{}
@@ -290,11 +442,8 @@ func (ws *WebServer) BroadcastStatus() {
 	}
 
 	// Broadcast to all clients
-	select {
-	case ws.wsHub.broadcast <- jsonData:
-		log.Printf("Broadcasted status update to %d clients", len(ws.wsHub.clients))
-	default:
-		log.Printf("No clients connected to receive broadcast")
+	if !ws.wsHub.publish(jsonData) {
+		log.Printf("WebSocket status update coalesced or hub stopped")
 	}
 }
 
@@ -302,7 +451,7 @@ func (ws *WebServer) BroadcastStatus() {
 func (ws *WebServer) websocketHandler(c *gin.Context) {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
-			return true // Allow connections from any origin
+			return websocketOriginMatches(r)
 		},
 	}
 
@@ -318,11 +467,53 @@ func (ws *WebServer) websocketHandler(c *gin.Context) {
 		send: make(chan []byte, 256),
 	}
 
-	client.hub.register <- client
+	if !client.hub.registerClient(client) {
+		_ = conn.Close()
+		return
+	}
 
 	// Start goroutines for reading and writing
 	go client.writePump()
 	go client.readPump()
+}
+
+func websocketOriginMatches(request *http.Request) bool {
+	origin := strings.TrimSpace(request.Header.Get("Origin"))
+	if origin == "" {
+		return false
+	}
+	return requestOriginMatches(request, origin)
+}
+
+func requestOriginMatches(request *http.Request, origin string) bool {
+	parsed, err := neturl.Parse(origin)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+		return false
+	}
+	actualOrigin := strings.ToLower(parsed.Scheme + "://" + parsed.Host)
+
+	expectedOrigin, err := publicOriginForRequest(request)
+	return err == nil && actualOrigin == expectedOrigin
+}
+
+func publicOriginForRequest(request *http.Request) (string, error) {
+	if configuredOrigin := strings.TrimSpace(os.Getenv("FILABRIDGE_PUBLIC_ORIGIN")); configuredOrigin != "" {
+		origin, err := serviceOrigin(configuredOrigin)
+		if err != nil {
+			return "", fmt.Errorf("invalid FILABRIDGE_PUBLIC_ORIGIN: %w", err)
+		}
+		return origin, nil
+	}
+
+	scheme := "http"
+	if request.TLS != nil {
+		scheme = "https"
+	}
+	origin, err := serviceOrigin(scheme + "://" + request.Host)
+	if err != nil {
+		return "", fmt.Errorf("invalid request origin: %w", err)
+	}
+	return origin, nil
 }
 
 // WebSocket client methods
@@ -330,8 +521,8 @@ func (ws *WebServer) websocketHandler(c *gin.Context) {
 // readPump pumps messages from the WebSocket connection to the hub
 func (c *WebSocketClient) readPump() {
 	defer func() {
-		c.hub.unregister <- c
-		c.conn.Close()
+		c.hub.unregisterClient(c)
+		_ = c.conn.Close()
 	}()
 
 	c.conn.SetReadLimit(512)
@@ -397,6 +588,7 @@ func (c *WebSocketClient) writePump() {
 
 // dashboardHandler serves the main dashboard
 func (ws *WebServer) dashboardHandler(c *gin.Context) {
+	runtime := ws.bridge.runtimeSnapshot()
 	status, err := ws.bridge.GetStatus()
 	if err != nil {
 		c.HTML(http.StatusInternalServerError, "error.html", gin.H{
@@ -408,7 +600,7 @@ func (ws *WebServer) dashboardHandler(c *gin.Context) {
 	// Test Spoolman connection
 	spoolmanConnected := true
 	spoolmanError := ""
-	spools, err := ws.bridge.spoolman.GetAllSpools()
+	spools, err := runtime.spoolman.GetAllSpools()
 	if err != nil {
 		spoolmanConnected = false
 		spoolmanError = err.Error()
@@ -434,10 +626,10 @@ func (ws *WebServer) dashboardHandler(c *gin.Context) {
 		"HasPrintErrors":    hasPrintErrors,
 		"PrintErrors":       printErrors,
 		"IsFirstRun":        isFirstRun,
-		"Printers":          ws.bridge.config.Printers,
+		"Printers":          runtime.config.Printers,
 		"SpoolmanConnected": spoolmanConnected,
 		"SpoolmanError":     spoolmanError,
-		"SpoolmanBaseURL":   ws.bridge.config.SpoolmanURL,
+		"SpoolmanBaseURL":   runtime.config.SpoolmanURL,
 	})
 }
 
@@ -463,6 +655,7 @@ func (ws *WebServer) statusHandler(c *gin.Context) {
 
 // spoolsHandler returns all spools as JSON
 func (ws *WebServer) spoolsHandler(c *gin.Context) {
+	spoolman := ws.bridge.spoolmanSnapshot()
 	includeEmpty := strings.EqualFold(c.DefaultQuery("include_empty", "false"), "true") || c.DefaultQuery("include_empty", "0") == "1"
 
 	var (
@@ -471,9 +664,9 @@ func (ws *WebServer) spoolsHandler(c *gin.Context) {
 	)
 
 	if includeEmpty {
-		spools, err = ws.bridge.spoolman.GetAllSpoolsIncludingEmpty()
+		spools, err = spoolman.GetAllSpoolsIncludingEmpty()
 	} else {
-		spools, err = ws.bridge.spoolman.GetAllSpools()
+		spools, err = spoolman.GetAllSpools()
 	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -609,7 +802,7 @@ func (ws *WebServer) importPrintHistoryHandler(c *gin.Context) {
 
 // filamentsHandler returns all filament types as JSON
 func (ws *WebServer) filamentsHandler(c *gin.Context) {
-	filaments, err := ws.bridge.spoolman.GetAllFilaments()
+	filaments, err := ws.bridge.spoolmanSnapshot().GetAllFilaments()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -638,6 +831,16 @@ func validatePrinterConfig(config PrinterConfig) error {
 func validateAddress(address string) error {
 	if address == "" {
 		return fmt.Errorf("address cannot be empty")
+	}
+	if strings.Contains(address, "://") {
+		parsed, err := neturl.Parse(address)
+		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			return fmt.Errorf("address must be an HTTP or HTTPS PrusaLink URL")
+		}
+		if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+			return fmt.Errorf("PrusaLink URL must not contain credentials, query, fragment, or path")
+		}
+		return nil
 	}
 	// Basic validation - check for reasonable length (hostnames can be longer than IPs)
 	// Minimum: 1 character (e.g., "a"), Maximum: 253 characters (RFC 1035)
@@ -720,7 +923,7 @@ func (ws *WebServer) availableSpoolsHandler(c *gin.Context) {
 	}
 
 	// Get all spools from Spoolman
-	allSpools, err := ws.bridge.spoolman.GetAllSpools()
+	allSpools, err := ws.bridge.spoolmanSnapshot().GetAllSpools()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -764,23 +967,73 @@ func (ws *WebServer) getConfigHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, config)
+	c.Header("Cache-Control", "no-store")
+	c.JSON(http.StatusOK, gin.H{
+		ConfigKeySpoolmanURL:                     config[ConfigKeySpoolmanURL],
+		ConfigKeySpoolmanUsername:                config[ConfigKeySpoolmanUsername],
+		"spoolman_password_configured":           config[ConfigKeySpoolmanPassword] != "",
+		ConfigKeyConsumptionAuthority:            config[ConfigKeyConsumptionAuthority],
+		ConfigKeyPollInterval:                    config[ConfigKeyPollInterval],
+		ConfigKeyLocationSyncInterval:            config[ConfigKeyLocationSyncInterval],
+		ConfigKeyWebPort:                         config[ConfigKeyWebPort],
+		ConfigKeyPrusaLinkTimeout:                config[ConfigKeyPrusaLinkTimeout],
+		ConfigKeyPrusaLinkFileDownloadTimeout:    config[ConfigKeyPrusaLinkFileDownloadTimeout],
+		ConfigKeySpoolmanTimeout:                 config[ConfigKeySpoolmanTimeout],
+		ConfigKeyAutoAssignPreviousSpoolEnabled:  config[ConfigKeyAutoAssignPreviousSpoolEnabled],
+		ConfigKeyAutoAssignPreviousSpoolLocation: config[ConfigKeyAutoAssignPreviousSpoolLocation],
+	})
+}
+
+type configUpdateRequest struct {
+	SpoolmanURL                  *string               `json:"spoolman_url"`
+	SpoolmanUsername             *string               `json:"spoolman_username"`
+	SpoolmanPassword             *string               `json:"spoolman_password"`
+	ClearSpoolmanPassword        bool                  `json:"clear_spoolman_password"`
+	ConsumptionAuthority         *ConsumptionAuthority `json:"consumption_authority"`
+	PollInterval                 *int                  `json:"poll_interval"`
+	LocationSyncInterval         *int                  `json:"location_sync_interval"`
+	WebPort                      *int                  `json:"web_port"`
+	PrusaLinkTimeout             *int                  `json:"prusalink_timeout"`
+	PrusaLinkFileDownloadTimeout *int                  `json:"prusalink_file_download_timeout"`
+	SpoolmanTimeout              *int                  `json:"spoolman_timeout"`
 }
 
 // updateConfigHandler updates configuration
 func (ws *WebServer) updateConfigHandler(c *gin.Context) {
-	var config map[string]string
-	if err := c.ShouldBindJSON(&config); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	var request configUpdateRequest
+	if err := decoder.Decode(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid configuration payload: " + err.Error()})
+		return
+	}
+	if err := ensureJSONDocumentEnded(decoder); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Update each config value
-	for key, value := range config {
-		if err := ws.bridge.SetConfigValue(key, value); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	current, err := ws.bridge.GetAllConfig()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	updates, err := validatedConfigUpdates(request, current)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if len(updates) == 0 {
+		if request.SpoolmanPassword != nil && *request.SpoolmanPassword == "" {
+			c.JSON(http.StatusOK, gin.H{"message": "Configuration updated successfully"})
 			return
 		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": "configuration update contains no changes"})
+		return
+	}
+	if err := ws.persistConfigUpdates(updates); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 
 	// Reload configuration
@@ -796,6 +1049,135 @@ func (ws *WebServer) updateConfigHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Configuration updated successfully"})
+}
+
+func ensureJSONDocumentEnded(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("configuration payload must contain exactly one JSON object")
+		}
+		return fmt.Errorf("invalid configuration payload: %w", err)
+	}
+	return nil
+}
+
+func validatedConfigUpdates(request configUpdateRequest, current map[string]string) (map[string]string, error) {
+	updates := make(map[string]string)
+	if request.ClearSpoolmanPassword && request.SpoolmanPassword != nil && *request.SpoolmanPassword != "" {
+		return nil, fmt.Errorf("spoolman_password and clear_spoolman_password cannot be used together")
+	}
+
+	if request.SpoolmanURL != nil {
+		spoolmanURL, err := validateServiceBaseURL(*request.SpoolmanURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Spoolman URL: %w", err)
+		}
+		currentOrigin, _ := serviceOrigin(current[ConfigKeySpoolmanURL])
+		newOrigin, _ := serviceOrigin(spoolmanURL)
+		passwordReentered := request.SpoolmanPassword != nil && *request.SpoolmanPassword != ""
+		if current[ConfigKeySpoolmanPassword] != "" && currentOrigin != newOrigin && !passwordReentered && !request.ClearSpoolmanPassword {
+			return nil, fmt.Errorf("changing the Spoolman origin requires re-entering or explicitly clearing its password")
+		}
+		updates[ConfigKeySpoolmanURL] = spoolmanURL
+	}
+	if request.SpoolmanUsername != nil {
+		updates[ConfigKeySpoolmanUsername] = strings.TrimSpace(*request.SpoolmanUsername)
+	}
+	if request.ClearSpoolmanPassword {
+		updates[ConfigKeySpoolmanPassword] = ""
+	} else if request.SpoolmanPassword != nil && *request.SpoolmanPassword != "" {
+		updates[ConfigKeySpoolmanPassword] = *request.SpoolmanPassword
+	}
+	if request.ConsumptionAuthority != nil {
+		authority, err := ParseConsumptionAuthority(string(*request.ConsumptionAuthority))
+		if err != nil {
+			return nil, err
+		}
+		updates[ConfigKeyConsumptionAuthority] = string(authority)
+	}
+	if err := addBoundedConfigInt(updates, ConfigKeyPollInterval, request.PollInterval, 10, 300); err != nil {
+		return nil, err
+	}
+	if err := addBoundedConfigInt(updates, ConfigKeyLocationSyncInterval, request.LocationSyncInterval, 1, 1440); err != nil {
+		return nil, err
+	}
+	if err := addBoundedConfigInt(updates, ConfigKeyWebPort, request.WebPort, 1, 65535); err != nil {
+		return nil, err
+	}
+	if err := addBoundedConfigInt(updates, ConfigKeyPrusaLinkTimeout, request.PrusaLinkTimeout, 5, 300); err != nil {
+		return nil, err
+	}
+	if err := addBoundedConfigInt(updates, ConfigKeyPrusaLinkFileDownloadTimeout, request.PrusaLinkFileDownloadTimeout, 10, 600); err != nil {
+		return nil, err
+	}
+	if err := addBoundedConfigInt(updates, ConfigKeySpoolmanTimeout, request.SpoolmanTimeout, 5, 300); err != nil {
+		return nil, err
+	}
+
+	return updates, nil
+}
+
+func addBoundedConfigInt(updates map[string]string, key string, value *int, minimum, maximum int) error {
+	if value == nil {
+		return nil
+	}
+	if *value < minimum || *value > maximum {
+		return fmt.Errorf("%s must be between %d and %d", key, minimum, maximum)
+	}
+	updates[key] = strconv.Itoa(*value)
+	return nil
+}
+
+func validateServiceBaseURL(value string) (string, error) {
+	value = strings.TrimRight(strings.TrimSpace(value), "/")
+	parsed, err := neturl.Parse(value)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("must be an absolute HTTP or HTTPS URL")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Path != "" {
+		return "", fmt.Errorf("must not contain credentials, query, fragment, or path")
+	}
+	return value, nil
+}
+
+func serviceOrigin(value string) (string, error) {
+	validated, err := validateServiceBaseURL(value)
+	if err != nil {
+		return "", err
+	}
+	parsed, err := neturl.Parse(validated)
+	if err != nil {
+		return "", err
+	}
+	return strings.ToLower(parsed.Scheme + "://" + parsed.Host), nil
+}
+
+func (ws *WebServer) persistConfigUpdates(updates map[string]string) error {
+	tx, err := ws.bridge.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin configuration update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	keys := make([]string, 0, len(updates))
+	for key := range updates {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if _, err := tx.Exec(`
+			INSERT INTO configuration (key, value, updated_at)
+			VALUES (?, ?, CURRENT_TIMESTAMP)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+		`, key, updates[key]); err != nil {
+			return fmt.Errorf("save configuration key %s: %w", key, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit configuration update: %w", err)
+	}
+	return nil
 }
 
 // getAutoAssignPreviousSpoolHandler returns current auto-assign previous spool settings
@@ -857,11 +1239,15 @@ func (ws *WebServer) getPrintersHandler(c *gin.Context) {
 	result := make(map[string]interface{})
 	for printerID, printerConfig := range printerConfigs {
 		printerData := map[string]interface{}{
-			"name":       printerConfig.Name,
-			"model":      printerConfig.Model,
-			"ip_address": printerConfig.IPAddress,
-			"api_key":    printerConfig.APIKey,
-			"toolheads":  printerConfig.Toolheads,
+			"name":                           printerConfig.Name,
+			"preset_id":                      resolvedPrinterPresetID(printerConfig.Model, printerConfig.Toolheads),
+			"model":                          printerConfig.Model,
+			"ip_address":                     printerConfig.IPAddress,
+			"api_key_configured":             printerConfig.APIKey != "",
+			"prusalink_username":             printerConfig.PrusaLinkUsername,
+			"prusalink_password_configured":  printerConfig.PrusaLinkPassword != "",
+			"prusalink_custom_ca_configured": printerConfig.PrusaLinkCustomCAPEM != "",
+			"toolheads":                      printerConfig.Toolheads,
 		}
 
 		// Get toolhead names for this printer
@@ -885,6 +1271,150 @@ func (ws *WebServer) getPrintersHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"printers": result})
 }
 
+// printerPresetsHandler returns model/toolhead combinations supported by the
+// settings UI. The custom ID keeps manual and third-party configs available.
+func (ws *WebServer) printerPresetsHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"presets":          PrinterPresets(),
+		"custom_preset_id": CustomPrinterPresetID,
+	})
+}
+
+func (ws *WebServer) getLogicalToolRoutesHandler(c *gin.Context) {
+	printerConfig, ok := ws.printerConfigByID(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "printer not found"})
+		return
+	}
+	routes, err := ws.bridge.GetLogicalToolRoutes(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	for logicalToolID := 0; logicalToolID < printerConfig.Toolheads; logicalToolID++ {
+		if _, exists := routes[logicalToolID]; !exists {
+			routes[logicalToolID] = logicalToolID
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"routes": routes})
+}
+
+func (ws *WebServer) updateLogicalToolRouteHandler(c *gin.Context) {
+	printerConfig, ok := ws.printerConfigByID(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "printer not found"})
+		return
+	}
+	logicalToolID, err := strconv.Atoi(c.Param("logical_tool_id"))
+	if err != nil || logicalToolID < 0 || logicalToolID >= printerConfig.Toolheads {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "logical tool ID is outside printer range"})
+		return
+	}
+	var request struct {
+		PhysicalToolheadID int `json:"physical_toolhead_id"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON payload"})
+		return
+	}
+	if request.PhysicalToolheadID < 0 || request.PhysicalToolheadID >= printerConfig.Toolheads {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "physical toolhead ID is outside printer range"})
+		return
+	}
+	if err := ws.bridge.SetLogicalToolRoute(c.Param("id"), logicalToolID, request.PhysicalToolheadID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"logical_tool_id": logicalToolID, "physical_toolhead_id": request.PhysicalToolheadID})
+}
+
+func (ws *WebServer) resetLogicalToolRouteHandler(c *gin.Context) {
+	printerConfig, ok := ws.printerConfigByID(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "printer not found"})
+		return
+	}
+	logicalToolID, err := strconv.Atoi(c.Param("logical_tool_id"))
+	if err != nil || logicalToolID < 0 || logicalToolID >= printerConfig.Toolheads {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "logical tool ID is outside printer range"})
+		return
+	}
+	if err := ws.bridge.ResetLogicalToolRoute(c.Param("id"), logicalToolID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (ws *WebServer) printerConfigByID(printerID string) (PrinterConfig, bool) {
+	configs, err := ws.bridge.GetAllPrinterConfigs()
+	if err != nil {
+		return PrinterConfig{}, false
+	}
+	config, ok := configs[printerID]
+	return config, ok
+}
+
+func (ws *WebServer) prusaLinkDiagnosticsHandler(c *gin.Context) {
+	printerConfig, ok := ws.printerConfigByID(c.Param("id"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "printer not found"})
+		return
+	}
+	settings := ws.bridge.GetConfigSnapshot()
+	if settings == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "configuration is unavailable"})
+		return
+	}
+	client, err := newConfiguredPrusaLinkClient(printerConfig, settings.PrusaLinkTimeout, settings.PrusaLinkFileDownloadTimeout)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	diagnostics, err := client.GetDiagnostics()
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, diagnostics)
+}
+
+func (ws *WebServer) getJobReconciliationHandler(c *gin.Context) {
+	checkpoint, err := ws.bridge.loadPrinterJobCheckpoint(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if checkpoint == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "printer has no job checkpoint"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"job_name":          checkpoint.JobName,
+		"source_path":       checkpoint.SourcePath,
+		"last_state":        checkpoint.LastState,
+		"progress":          checkpoint.Progress,
+		"accounting_status": checkpoint.AccountingStatus,
+		"terminal_state":    checkpoint.TerminalState,
+		"started_at":        checkpoint.StartedAt,
+	})
+}
+
+func (ws *WebServer) resolveJobReconciliationHandler(c *gin.Context) {
+	var request struct {
+		Outcome string `json:"outcome" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "outcome is required"})
+		return
+	}
+	if err := ws.bridge.resolvePrinterJobCheckpoint(c.Param("id"), request.Outcome); err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"resolved": true, "outcome": strings.ToUpper(strings.TrimSpace(request.Outcome))})
+}
+
 // addPrinterHandler adds a new printer configuration
 func (ws *WebServer) addPrinterHandler(c *gin.Context) {
 	// Serialize printer operations to prevent race conditions
@@ -893,6 +1423,11 @@ func (ws *WebServer) addPrinterHandler(c *gin.Context) {
 
 	var printerConfig PrinterConfig
 	if err := c.ShouldBindJSON(&printerConfig); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	printerConfig, err := ApplyPrinterPreset(printerConfig)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -935,8 +1470,59 @@ func (ws *WebServer) updatePrinterHandler(c *gin.Context) {
 
 	printerID := c.Param("id")
 
-	var printerConfig PrinterConfig
-	if err := c.ShouldBindJSON(&printerConfig); err != nil {
+	var request struct {
+		PrinterConfig
+		ClearAPIKey               bool `json:"clear_api_key"`
+		ClearPrusaLinkCredentials bool `json:"clear_prusalink_credentials"`
+		ClearPrusaLinkPassword    bool `json:"clear_prusalink_password"`
+		ClearPrusaLinkCustomCAPEM bool `json:"clear_prusalink_custom_ca_pem"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	printerConfig := request.PrinterConfig
+	existingConfig, exists := ws.printerConfigByID(printerID)
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Printer not found"})
+		return
+	}
+	originChanged := strings.TrimRight(strings.TrimSpace(printerConfig.IPAddress), "/") != strings.TrimRight(strings.TrimSpace(existingConfig.IPAddress), "/")
+	if originChanged {
+		if existingConfig.APIKey != "" && printerConfig.APIKey == "" && !request.ClearAPIKey {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "changing the PrusaLink address requires re-entering or explicitly clearing the API key"})
+			return
+		}
+		if (existingConfig.PrusaLinkUsername != "" || existingConfig.PrusaLinkPassword != "") && printerConfig.PrusaLinkPassword == "" && !request.ClearPrusaLinkCredentials {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "changing the PrusaLink address requires re-entering or explicitly clearing Digest credentials"})
+			return
+		}
+		if existingConfig.PrusaLinkCustomCAPEM != "" && printerConfig.PrusaLinkCustomCAPEM == "" && !request.ClearPrusaLinkCustomCAPEM {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "changing the PrusaLink address requires re-entering or explicitly clearing the custom CA"})
+			return
+		}
+	}
+	// Connection secrets are write-only. Empty values retain the stored value;
+	// clients replace a secret by sending a non-empty value.
+	if printerConfig.APIKey == "" && !request.ClearAPIKey {
+		printerConfig.APIKey = existingConfig.APIKey
+	}
+	if request.ClearPrusaLinkCredentials {
+		printerConfig.PrusaLinkUsername = ""
+		printerConfig.PrusaLinkPassword = ""
+	} else {
+		if printerConfig.PrusaLinkUsername == "" {
+			printerConfig.PrusaLinkUsername = existingConfig.PrusaLinkUsername
+		}
+		if printerConfig.PrusaLinkPassword == "" && !request.ClearPrusaLinkPassword {
+			printerConfig.PrusaLinkPassword = existingConfig.PrusaLinkPassword
+		}
+	}
+	if printerConfig.PrusaLinkCustomCAPEM == "" && !request.ClearPrusaLinkCustomCAPEM {
+		printerConfig.PrusaLinkCustomCAPEM = existingConfig.PrusaLinkCustomCAPEM
+	}
+	printerConfig, err := ApplyPrinterPreset(printerConfig)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -958,7 +1544,11 @@ func (ws *WebServer) updatePrinterHandler(c *gin.Context) {
 		log.Printf("🔍 [Auto-Detection] Detecting model for printer %s (IP: %s)", printerID, printerConfig.IPAddress)
 
 		// Create PrusaLink client for detection
-		client := NewPrusaLinkClient(printerConfig.IPAddress, printerConfig.APIKey, 10, 60) // Use default timeouts for detection
+		client, clientErr := newConfiguredPrusaLinkClient(printerConfig, 10, 60)
+		if clientErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": clientErr.Error()})
+			return
+		}
 
 		// Try to get printer info
 		printerInfo, err := client.GetPrinterInfo()
@@ -1106,32 +1696,7 @@ func (ws *WebServer) updateToolheadNameHandler(c *gin.Context) {
 
 // detectPrinterModel detects printer model from hostname
 func detectPrinterModel(hostname string) string {
-	model := ModelUnknown
-	hostnameLower := strings.ToLower(hostname)
-	hostnameLower = strings.TrimSpace(hostnameLower) // Clean up any whitespace
-
-	log.Printf("🔍 [Detection] Checking hostname '%s' against patterns:", hostnameLower)
-
-	if strings.Contains(hostnameLower, ModelCorePattern) {
-		model = ModelCoreOne
-		log.Printf("✅ [Detection] Matched pattern '%s' -> %s", ModelCorePattern, model)
-	} else if strings.Contains(hostnameLower, ModelXLPattern) {
-		model = ModelXL
-		log.Printf("✅ [Detection] Matched pattern '%s' -> %s", ModelXLPattern, model)
-	} else if strings.Contains(hostnameLower, ModelMK4Pattern) {
-		model = ModelMK4
-		log.Printf("✅ [Detection] Matched pattern '%s' -> %s", ModelMK4Pattern, model)
-	} else if strings.Contains(hostnameLower, ModelMK3Pattern) {
-		model = ModelMK35
-		log.Printf("✅ [Detection] Matched pattern '%s' -> %s", ModelMK3Pattern, model)
-	} else if strings.Contains(hostnameLower, ModelMiniPattern) {
-		model = ModelMiniPlus
-		log.Printf("✅ [Detection] Matched pattern '%s' -> %s", ModelMiniPattern, model)
-	} else {
-		log.Printf("❌ [Detection] No pattern matched for hostname '%s'. Available patterns: %s, %s, %s, %s, %s",
-			hostnameLower, ModelCorePattern, ModelXLPattern, ModelMK4Pattern, ModelMK3Pattern, ModelMiniPattern)
-	}
-
+	model := DetectPrinterModel(hostname)
 	log.Printf("🎯 [Detection] Final result: hostname='%s' -> model='%s'", hostname, model)
 	return model
 }
@@ -1139,8 +1704,11 @@ func detectPrinterModel(hostname string) string {
 // detectPrinterHandler detects printer model from PrusaLink API
 func (ws *WebServer) detectPrinterHandler(c *gin.Context) {
 	var req struct {
-		IPAddress string `json:"ip_address" binding:"required"`
-		APIKey    string `json:"api_key" binding:"required"`
+		IPAddress            string `json:"ip_address" binding:"required"`
+		APIKey               string `json:"api_key"`
+		PrusaLinkUsername    string `json:"prusalink_username"`
+		PrusaLinkPassword    string `json:"prusalink_password"`
+		PrusaLinkCustomCAPEM string `json:"prusalink_custom_ca_pem"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1157,7 +1725,17 @@ func (ws *WebServer) detectPrinterHandler(c *gin.Context) {
 	log.Printf("🔍 [Detection] Starting printer model detection for IP: %s", req.IPAddress)
 
 	// Create PrusaLink client
-	client := NewPrusaLinkClient(req.IPAddress, req.APIKey, 10, 60) // Use default timeouts for detection
+	client, err := newConfiguredPrusaLinkClient(PrinterConfig{
+		IPAddress:            req.IPAddress,
+		APIKey:               req.APIKey,
+		PrusaLinkUsername:    req.PrusaLinkUsername,
+		PrusaLinkPassword:    req.PrusaLinkPassword,
+		PrusaLinkCustomCAPEM: req.PrusaLinkCustomCAPEM,
+	}, 10, 60)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	// Try to get printer info, but don't fail if it times out
 	printerInfo, err := client.GetPrinterInfo()
@@ -1189,7 +1767,7 @@ func (ws *WebServer) detectPrinterHandler(c *gin.Context) {
 
 // testSpoolmanConnectionHandler tests the connection to Spoolman
 func (ws *WebServer) testSpoolmanConnectionHandler(c *gin.Context) {
-	if err := ws.bridge.spoolman.TestConnection(); err != nil {
+	if err := ws.bridge.spoolmanSnapshot().TestConnection(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "connected": false})
 		return
 	}
@@ -1197,9 +1775,99 @@ func (ws *WebServer) testSpoolmanConnectionHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Connection successful", "connected": true})
 }
 
+func (ws *WebServer) spoolmanCapabilitiesHandler(c *gin.Context) {
+	capabilities, err := ws.bridge.spoolmanSnapshot().DetectCapabilities()
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, capabilities)
+}
+
+func (ws *WebServer) lookupSpoolmanTagHandler(c *gin.Context) {
+	uid := strings.TrimSpace(c.Param("uid"))
+	if uid == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tag UID is required"})
+		return
+	}
+	spool, err := ws.bridge.spoolmanSnapshot().LookupSpoolByTagUID(uid)
+	if errors.Is(err, ErrSpoolmanTagAPIUnsupported) {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": err.Error(), "supported": false})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"supported": true, "spool": spool})
+}
+
+func (ws *WebServer) associateSpoolmanTagHandler(c *gin.Context) {
+	spoolID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || spoolID < 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "valid spool ID is required"})
+		return
+	}
+	var request struct {
+		UID    string `json:"uid" binding:"required"`
+		Format string `json:"format"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil || strings.TrimSpace(request.UID) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tag UID is required"})
+		return
+	}
+	if request.Format == "" {
+		request.Format = "openprinttag"
+	}
+	tag, err := ws.bridge.spoolmanSnapshot().AssociateTagWithSpool(spoolID, request.UID, request.Format)
+	if errors.Is(err, ErrSpoolmanTagAPIUnsupported) {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": err.Error(), "supported": false})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"supported": true, "tag": tag})
+}
+
+func (ws *WebServer) getSpoolConsumptionAuthorityHandler(c *gin.Context) {
+	spoolID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || spoolID < 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "valid spool ID is required"})
+		return
+	}
+	authority, err := ws.bridge.GetSpoolConsumptionAuthority(spoolID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"spool_id": spoolID, "authority": authority})
+}
+
+func (ws *WebServer) updateSpoolConsumptionAuthorityHandler(c *gin.Context) {
+	spoolID, err := strconv.Atoi(c.Param("id"))
+	if err != nil || spoolID < 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "valid spool ID is required"})
+		return
+	}
+	var request struct {
+		Authority ConsumptionAuthority `json:"authority" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&request); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "authority is required"})
+		return
+	}
+	if err := ws.bridge.SetSpoolConsumptionAuthority(spoolID, request.Authority); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"spool_id": spoolID, "authority": request.Authority})
+}
+
 // debugSpoolmanHandler provides detailed debug information about Spoolman data
 func (ws *WebServer) debugSpoolmanHandler(c *gin.Context) {
-	spools, err := ws.bridge.spoolman.GetAllSpools()
+	spools, err := ws.bridge.spoolmanSnapshot().GetAllSpools()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1228,69 +1896,6 @@ func (ws *WebServer) debugSpoolmanHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, debugInfo)
-}
-
-// testPrintCompleteHandler simulates a print completion for testing
-func (ws *WebServer) testPrintCompleteHandler(c *gin.Context) {
-	var request struct {
-		PrinterName   string          `json:"printer_name" binding:"required"`
-		JobName       string          `json:"job_name"`
-		FilamentUsage map[int]float64 `json:"filament_usage"`
-	}
-
-	if err := c.ShouldBindJSON(&request); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	if request.JobName == "" {
-		request.JobName = "Test Print Job"
-	}
-
-	// If no filament usage provided, use default test values
-	if len(request.FilamentUsage) == 0 {
-		request.FilamentUsage = map[int]float64{
-			0: 10.0, // 10g for toolhead 0
-		}
-	}
-
-	// Get printer config - first try by name, then by ID
-	var config PrinterConfig
-	var found bool
-
-	// Try to find by name first
-	for _, printerConfig := range ws.bridge.config.Printers {
-		if printerConfig.Name == request.PrinterName {
-			config = printerConfig
-			found = true
-			break
-		}
-	}
-
-	// If not found by name, try by ID
-	if !found {
-		config, found = ws.bridge.config.Printers[request.PrinterName]
-	}
-
-	if !found {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Printer not found"})
-		return
-	}
-
-	// Simulate the print completion with provided filament usage
-	printerName := resolvePrinterName(config)
-
-	// Process filament usage using helper function
-	if err := ws.bridge.processFilamentUsage(printerName, request.FilamentUsage, request.JobName, ""); err != nil {
-		log.Printf("Error processing filament usage: %v", err)
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message":        "Print completion simulated successfully",
-		"printer":        request.PrinterName,
-		"job":            request.JobName,
-		"filament_usage": request.FilamentUsage,
-	})
 }
 
 // getPrintErrorsHandler returns all unacknowledged print errors
@@ -1339,46 +1944,87 @@ func (ws *WebServer) Start(port string) error {
 	return ws.router.Run(":" + port)
 }
 
-// nfcAssignHandler handles NFC tag scans
+type nfcAssignmentInput struct {
+	spoolID           int
+	spoolIDText       string
+	locationText      string
+	printerName       string
+	toolheadID        int
+	locationName      string
+	isPrinterLocation bool
+}
+
+func (ws *WebServer) parseNFCAssignmentInput(spoolIDText string, locationText string) (nfcAssignmentInput, error) {
+	input := nfcAssignmentInput{
+		spoolIDText:  strings.TrimSpace(spoolIDText),
+		locationText: strings.TrimSpace(locationText),
+	}
+	if input.spoolIDText == "" && input.locationText == "" {
+		return input, fmt.Errorf("a spool or location tag value is required")
+	}
+	if input.spoolIDText != "" {
+		spoolID, err := strconv.Atoi(input.spoolIDText)
+		if err != nil || spoolID <= 0 {
+			return input, fmt.Errorf("invalid spool ID")
+		}
+		input.spoolID = spoolID
+	}
+	if input.locationText != "" {
+		printerName, toolheadID, locationName, isPrinterLocation, err := ws.bridge.parseLocationParam(input.locationText)
+		if err != nil {
+			return input, err
+		}
+		input.printerName = printerName
+		input.toolheadID = toolheadID
+		input.locationName = locationName
+		input.isPrinterLocation = isPrinterLocation
+	}
+	return input, nil
+}
+
+// nfcAssignConfirmationHandler previews a scanned tag without changing state.
+func (ws *WebServer) nfcAssignConfirmationHandler(c *gin.Context) {
+	input, err := ws.parseNFCAssignmentInput(c.Query("spool"), c.Query("location"))
+	if err != nil {
+		c.HTML(http.StatusBadRequest, "nfc_error.html", gin.H{"Error": err.Error()})
+		return
+	}
+	description := input.locationText
+	if input.spoolID > 0 {
+		description = fmt.Sprintf("Spool %d", input.spoolID)
+		if input.locationText != "" {
+			description += " and location " + input.locationText
+		}
+	}
+	c.HTML(http.StatusOK, "nfc_confirm.html", gin.H{
+		"Description": description,
+		"SpoolID":     input.spoolID,
+		"Location":    input.locationText,
+	})
+}
+
+// nfcAssignHandler applies a confirmed NFC scan. Its POST route is protected
+// by managementOriginMiddleware before this handler runs.
 func (ws *WebServer) nfcAssignHandler(c *gin.Context) {
-	spoolIDStr := c.Query("spool")
-	locationStr := c.Query("location")
+	spoolIDText := c.PostForm("spool")
+	locationText := c.PostForm("location")
+	// Authenticated non-browser clients may use POST query parameters.
+	if spoolIDText == "" {
+		spoolIDText = c.Query("spool")
+	}
+	if locationText == "" {
+		locationText = c.Query("location")
+	}
+	input, err := ws.parseNFCAssignmentInput(spoolIDText, locationText)
+	if err != nil {
+		c.HTML(http.StatusBadRequest, "nfc_error.html", gin.H{"Error": err.Error()})
+		return
+	}
 	clientIP := getClientIP(c.ClientIP())
-
-	// Generate session ID based on client IP
-	sessionID := generateSessionID(clientIP)
-
-	var spoolID int
-	var printerName string
-	var toolheadID int
-	var err error
-
-	// Parse parameters
-	if spoolIDStr != "" {
-		spoolID, err = strconv.Atoi(spoolIDStr)
-		if err != nil {
-			c.HTML(http.StatusBadRequest, "nfc_error.html", gin.H{
-				"Error": "Invalid spool ID",
-			})
-			return
-		}
-	}
-
-	var locationName string
-	var isPrinterLocation bool
-
-	if locationStr != "" {
-		printerName, toolheadID, locationName, isPrinterLocation, err = ws.bridge.parseLocationParam(locationStr)
-		if err != nil {
-			c.HTML(http.StatusBadRequest, "nfc_error.html", gin.H{
-				"Error": err.Error(),
-			})
-			return
-		}
-	}
+	serviceSessionID := generateSessionID(clientIP)
 
 	// Create or update session
-	session, err := ws.bridge.createOrUpdateSession(sessionID, spoolID, printerName, toolheadID, locationName, isPrinterLocation)
+	session, err := ws.bridge.createOrUpdateSession(serviceSessionID, input.spoolID, input.printerName, input.toolheadID, input.locationName, input.isPrinterLocation)
 	if err != nil {
 		c.HTML(http.StatusInternalServerError, "nfc_error.html", gin.H{
 			"Error": "Failed to create session: " + err.Error(),
@@ -1401,7 +2047,7 @@ func (ws *WebServer) nfcAssignHandler(c *gin.Context) {
 		ws.BroadcastStatus()
 
 		// Clean up session
-		ws.bridge.deleteSession(sessionID)
+		ws.bridge.deleteSession(serviceSessionID)
 
 		// Show success page
 		c.HTML(http.StatusOK, "nfc_success.html", gin.H{
@@ -1430,7 +2076,7 @@ func (ws *WebServer) nfcAssignHandler(c *gin.Context) {
 
 	c.HTML(http.StatusOK, "nfc_progress.html", gin.H{
 		"Message":     message,
-		"SessionID":   sessionID,
+		"SessionID":   serviceSessionID,
 		"HasSpool":    session.HasSpool,
 		"HasLocation": session.HasLocation,
 	})
@@ -1439,9 +2085,15 @@ func (ws *WebServer) nfcAssignHandler(c *gin.Context) {
 // nfcUrlsHandler returns all available NFC URLs with QR codes
 func (ws *WebServer) nfcUrlsHandler(c *gin.Context) {
 	var urls []gin.H
+	runtime := ws.bridge.runtimeSnapshot()
+	publicOrigin, err := publicOriginForRequest(c.Request)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
 	// Get all spools
-	spools, err := ws.bridge.spoolman.GetAllSpools()
+	spools, err := runtime.spoolman.GetAllSpools()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1449,7 +2101,7 @@ func (ws *WebServer) nfcUrlsHandler(c *gin.Context) {
 
 	// Generate spool URLs
 	for _, spool := range spools {
-		url := fmt.Sprintf("http://%s/api/nfc/assign?spool=%d", c.Request.Host, spool.ID)
+		url := fmt.Sprintf("%s/api/nfc/assign?spool=%d", publicOrigin, spool.ID)
 
 		// Safely get color hex
 		colorHex := ""
@@ -1495,7 +2147,7 @@ func (ws *WebServer) nfcUrlsHandler(c *gin.Context) {
 	}
 
 	// Get all filaments
-	filaments, err := ws.bridge.spoolman.GetAllFilaments()
+	filaments, err := runtime.spoolman.GetAllFilaments()
 	if err != nil {
 		log.Printf("Warning: Failed to get filaments for NFC URLs: %v", err)
 		filaments = []SpoolmanFilament{}
@@ -1503,7 +2155,7 @@ func (ws *WebServer) nfcUrlsHandler(c *gin.Context) {
 
 	// Generate filament URLs
 	for _, filament := range filaments {
-		url := fmt.Sprintf("%s/filament/show/%d", ws.bridge.config.SpoolmanURL, filament.ID)
+		url := fmt.Sprintf("%s/filament/show/%d", runtime.config.SpoolmanURL, filament.ID)
 
 		// Safely get color hex
 		colorHex := ""
@@ -1561,7 +2213,7 @@ func (ws *WebServer) nfcUrlsHandler(c *gin.Context) {
 	}
 
 	// Get Spoolman locations
-	spoolmanLocations, err := ws.bridge.spoolman.GetLocations()
+	spoolmanLocations, err := runtime.spoolman.GetLocations()
 	if err != nil {
 		log.Printf("Warning: Failed to get Spoolman locations: %v", err)
 		spoolmanLocations = []SpoolmanLocation{}
@@ -1605,7 +2257,7 @@ func (ws *WebServer) nfcUrlsHandler(c *gin.Context) {
 		}
 
 		locationParam := location.Name
-		nfcUrl := fmt.Sprintf("http://%s/api/nfc/assign?location=%s", c.Request.Host, neturl.QueryEscape(locationParam))
+		nfcUrl := fmt.Sprintf("%s/api/nfc/assign?location=%s", publicOrigin, neturl.QueryEscape(locationParam))
 
 		// Generate QR code
 		qrCode, err := qrcode.Encode(nfcUrl, qrcode.Medium, 256)
@@ -1702,7 +2354,7 @@ func (ws *WebServer) nfcUrlsHandler(c *gin.Context) {
 	})
 
 	// Get Spoolman URL for the response
-	spoolmanURL := ws.bridge.spoolman.GetBaseURL()
+	spoolmanURL := runtime.spoolman.GetBaseURL()
 
 	c.JSON(http.StatusOK, gin.H{
 		"urls":         urls,
@@ -1741,8 +2393,9 @@ func (ws *WebServer) nfcSessionStatusHandler(c *gin.Context) {
 
 // getLocationsHandler returns only Spoolman locations (no virtual printer toolheads)
 func (ws *WebServer) getLocationsHandler(c *gin.Context) {
+	spoolman := ws.bridge.spoolmanSnapshot()
 	// Get Spoolman locations
-	spoolmanLocations, err := ws.bridge.spoolman.GetLocations()
+	spoolmanLocations, err := spoolman.GetLocations()
 	if err != nil {
 		log.Printf("Warning: Failed to get Spoolman locations: %v", err)
 		spoolmanLocations = []SpoolmanLocation{}
@@ -1769,7 +2422,7 @@ func (ws *WebServer) getLocationsHandler(c *gin.Context) {
 	}
 
 	// Get Spoolman URL for the message
-	spoolmanURL := ws.bridge.spoolman.GetBaseURL()
+	spoolmanURL := spoolman.GetBaseURL()
 
 	c.JSON(http.StatusOK, gin.H{
 		"locations":    allLocations,
@@ -1786,7 +2439,7 @@ func (ws *WebServer) getLocationStatusHandler(c *gin.Context) {
 	}
 
 	// Check if location exists in Spoolman
-	location, err := ws.bridge.spoolman.FindLocationByName(name)
+	location, err := ws.bridge.spoolmanSnapshot().FindLocationByName(name)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -1821,7 +2474,7 @@ func (ws *WebServer) createLocationHandler(c *gin.Context) {
 	}
 
 	log.Printf("createLocationHandler: creating location name='%s' in Spoolman", req.Name)
-	location, err := ws.bridge.spoolman.GetOrCreateLocation(req.Name)
+	location, err := ws.bridge.spoolmanSnapshot().GetOrCreateLocation(req.Name)
 	if err != nil {
 		log.Printf("createLocationHandler: failed: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -1838,6 +2491,7 @@ func (ws *WebServer) createLocationHandler(c *gin.Context) {
 
 // updateLocationHandler updates a location in Spoolman
 func (ws *WebServer) updateLocationHandler(c *gin.Context) {
+	spoolman := ws.bridge.spoolmanSnapshot()
 	oldName := c.Param("name")
 	if oldName == "" {
 		log.Printf("updateLocationHandler: missing location name")
@@ -1856,14 +2510,14 @@ func (ws *WebServer) updateLocationHandler(c *gin.Context) {
 	}
 
 	log.Printf("updateLocationHandler: renaming '%s' to '%s' in Spoolman", oldName, req.Name)
-	if err := ws.bridge.spoolman.UpdateLocationByName(oldName, req.Name); err != nil {
+	if err := spoolman.UpdateLocationByName(oldName, req.Name); err != nil {
 		log.Printf("updateLocationHandler: failed for name='%s': %v", oldName, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	// Get updated location
-	location, err := ws.bridge.spoolman.FindLocationByName(req.Name)
+	location, err := spoolman.FindLocationByName(req.Name)
 	if err != nil {
 		log.Printf("Warning: Could not get updated location '%s': %v", req.Name, err)
 		c.JSON(http.StatusOK, gin.H{"message": "Location updated successfully"})
@@ -1883,6 +2537,7 @@ func (ws *WebServer) updateLocationHandler(c *gin.Context) {
 
 // deleteLocationHandler archives a location in Spoolman (locations are archived, not deleted)
 func (ws *WebServer) deleteLocationHandler(c *gin.Context) {
+	spoolman := ws.bridge.spoolmanSnapshot()
 	name := c.Param("name")
 	if name == "" {
 		log.Printf("deleteLocationHandler: missing location name")
@@ -1891,7 +2546,7 @@ func (ws *WebServer) deleteLocationHandler(c *gin.Context) {
 	}
 
 	// Find location by name
-	location, err := ws.bridge.spoolman.FindLocationByName(name)
+	location, err := spoolman.FindLocationByName(name)
 	if err != nil {
 		log.Printf("deleteLocationHandler: error finding location '%s': %v", name, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -1905,7 +2560,7 @@ func (ws *WebServer) deleteLocationHandler(c *gin.Context) {
 
 	// Archive the location (Spoolman doesn't support deletion, only archiving)
 	log.Printf("deleteLocationHandler: archiving location '%s' (ID: %d)", name, location.ID)
-	if err := ws.bridge.spoolman.ArchiveLocation(location.ID); err != nil {
+	if err := spoolman.ArchiveLocation(location.ID); err != nil {
 		log.Printf("deleteLocationHandler: failed to archive location '%s': %v", name, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to archive location"})
 		return

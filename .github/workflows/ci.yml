@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.6'
+          cache: true
+      - name: Check formatting
+        run: |
+          git ls-files -z '*.go' | xargs -0 gofmt -w
+          git diff --exit-code
+      - name: Vet
+        run: go vet ./...
+      - name: Test with race detector
+        run: go test -race ./...
+      - name: Check reachable vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          govulncheck ./...
+      - name: Build
+        run: go build ./...
+      - name: Check browser JavaScript syntax
+        run: git ls-files -z 'static/js/*.js' | xargs -0 -n1 node --check
+      - name: Check release contracts
+        run: |
+          bash scripts/check-release-contract.sh
+          bash scripts/verify-golden-fixtures.sh --structure
+          bash scripts/test-release-evidence.sh
+          bash scripts/test-latest-promotion.sh
+
+  browser-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.6'
+          cache: true
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install browser test dependencies
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx --no-install playwright install --with-deps chromium
+      - name: Run browser smoke test
+        run: npm run test:browser

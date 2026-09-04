@@ -179,6 +179,67 @@ func TestImportPrusaConnectPrintHistorySkipsDuplicateRows(t *testing.T) {
 	}
 }
 
+func TestImportPrusaConnectPrintHistoryDeduplicatesMissingLifetimeIDByExternalJobIdentity(t *testing.T) {
+	spoolman := newHistoryTestSpoolmanServer()
+	defer spoolman.close()
+
+	bridge := newTestBridge(t, spoolman.server.URL)
+	if err := bridge.SavePrinterConfig("printer-a", PrinterConfig{
+		Name:      "Printer A",
+		Model:     ModelCoreOne,
+		IPAddress: "printer-a.local",
+		Toolheads: 1,
+	}); err != nil {
+		t.Fatalf("SavePrinterConfig() error = %v", err)
+	}
+
+	firstPayload := `{
+		"jobs": [{
+			"id": 70,
+			"lifetime_id": "   ",
+			"printer_uuid": "uuid-printer-a",
+			"state": "FIN_OK",
+			"start": 1713700000,
+			"end": 1713703600,
+			"file": {"display_name": "cube-v1.bgcode", "meta": {"filament_used_g": 59.39}}
+		}]
+	}`
+	secondPayload := `{
+		"jobs": [{
+			"id": 70,
+			"printer_uuid": "uuid-printer-a",
+			"state": "FIN_OK",
+			"start": 1713800000,
+			"end": 1713807200,
+			"file": {"display_name": "renamed-after-import.bgcode", "meta": {"filament_used_g": 60.00}}
+		}]
+	}`
+
+	first, err := bridge.ImportPrusaConnectPrintHistory("printer-a", 0, []byte(firstPayload))
+	if err != nil {
+		t.Fatalf("first ImportPrusaConnectPrintHistory() error = %v", err)
+	}
+	if first.ImportedRows != 1 {
+		t.Fatalf("first ImportedRows = %d, want 1", first.ImportedRows)
+	}
+
+	second, err := bridge.ImportPrusaConnectPrintHistory("printer-a", 0, []byte(secondPayload))
+	if err != nil {
+		t.Fatalf("second ImportPrusaConnectPrintHistory() error = %v", err)
+	}
+	if second.ImportedRows != 0 || second.DuplicateRows != 1 {
+		t.Fatalf("second summary = %#v, want 0 imported and 1 duplicate", second)
+	}
+
+	history, err := bridge.GetPrintHistory(10)
+	if err != nil {
+		t.Fatalf("GetPrintHistory() error = %v", err)
+	}
+	if len(history) != 1 || history[0].JobName != "cube-v1.bgcode" {
+		t.Fatalf("history = %#v, want only original imported job", history)
+	}
+}
+
 func TestImportPrusaConnectPrintHistoryUsesPerToolUsage(t *testing.T) {
 	spoolman := newHistoryTestSpoolmanServer()
 	defer spoolman.close()

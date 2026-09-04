@@ -25,6 +25,11 @@ build/
 
 # Dependency directories
 vendor/
+node_modules/
+
+# Browser test artifacts
+playwright-report/
+test-results/
 
 # Go workspace file
 go.work

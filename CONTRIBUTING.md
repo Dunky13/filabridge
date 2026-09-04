@@ -97,7 +97,8 @@ This format helps us automatically generate changelogs and determine semantic ve
 
 ### Prerequisites
 
-- Go 1.23 or higher
+- Go 1.25 or higher
+- Node.js 24 (for the Playwright browser smoke test)
 - Docker (for testing with Spoolman)
 - A PrusaLink-compatible printer (or mock for testing)
 
@@ -105,7 +106,7 @@ This format helps us automatically generate changelogs and determine semantic ve
 
 1. **Clone your fork**:
    ```bash
-   git clone https://github.com/needo37/filabridge.git
+   git clone https://github.com/Dunky13/filabridge.git
    cd filabridge
    ```
 
@@ -128,6 +129,9 @@ This format helps us automatically generate changelogs and determine semantic ve
 5. **Run tests**:
    ```bash
    go test ./...
+   npm ci --ignore-scripts --no-audit --no-fund
+   npx --no-install playwright install chromium
+   npm run test:browser
    ```
 
 ### Code Style
@@ -218,4 +222,3 @@ If you have questions about contributing:
 3. Reach out to the maintainers
 
 Thank you for contributing to FilaBridge! 🎉
-

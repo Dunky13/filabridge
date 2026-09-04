@@ -14,6 +14,7 @@ import (
 type NFCSession struct {
 	SessionID         string    `json:"session_id"`
 	SpoolID           int       `json:"spool_id"`
+	PrinterID         string    `json:"printer_id,omitempty"`
 	PrinterName       string    `json:"printer_name"`
 	ToolheadID        int       `json:"toolhead_id"`
 	LocationName      string    `json:"location_name"`
@@ -117,15 +118,27 @@ func getClientIP(remoteAddr string) string {
 
 // createOrUpdateSession creates a new session or updates an existing one
 func (b *FilamentBridge) createOrUpdateSession(sessionID string, spoolID int, printerName string, toolheadID int, locationName string, isPrinterLocation bool) (*NFCSession, error) {
+	var printerID string
+	if isPrinterLocation {
+		identity, err := b.resolvePrinterReference(printerName)
+		if err != nil {
+			return nil, err
+		}
+		printerID = identity.ID
+		printerName = identity.Name
+	}
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
 	// Check if session already exists
 	var existingSession NFCSession
 	err := b.db.QueryRow(
-		"SELECT session_id, spool_id, printer_name, toolhead_id, location_name, is_printer_location, created_at, expires_at FROM nfc_sessions WHERE session_id = ?",
+		`SELECT n.session_id, n.spool_id, COALESCE(n.printer_id, ''), COALESCE(p.name, ''),
+		 n.toolhead_id, n.location_name, n.is_printer_location, n.created_at, n.expires_at
+		 FROM nfc_sessions n LEFT JOIN printer_configs p ON p.printer_id = n.printer_id
+		 WHERE n.session_id = ?`,
 		sessionID,
-	).Scan(&existingSession.SessionID, &existingSession.SpoolID, &existingSession.PrinterName,
+	).Scan(&existingSession.SessionID, &existingSession.SpoolID, &existingSession.PrinterID, &existingSession.PrinterName,
 		&existingSession.ToolheadID, &existingSession.LocationName, &existingSession.IsPrinterLocation, &existingSession.CreatedAt, &existingSession.ExpiresAt)
 
 	if err == nil {
@@ -157,6 +170,7 @@ func (b *FilamentBridge) createOrUpdateSession(sessionID string, spoolID int, pr
 		// Update location data only if a new location is being scanned
 		if (isPrinterLocation && printerName != "" && toolheadID >= 0) || (!isPrinterLocation && locationName != "") {
 			existingSession.PrinterName = printerName
+			existingSession.PrinterID = printerID
 			existingSession.ToolheadID = toolheadID
 			existingSession.LocationName = locationName
 			existingSession.IsPrinterLocation = isPrinterLocation
@@ -164,8 +178,8 @@ func (b *FilamentBridge) createOrUpdateSession(sessionID string, spoolID int, pr
 
 			// Update only location fields in database, preserve spool_id
 			_, err = b.db.Exec(
-				"UPDATE nfc_sessions SET printer_name = ?, toolhead_id = ?, location_name = ?, is_printer_location = ? WHERE session_id = ?",
-				printerName, toolheadID, locationName, isPrinterLocation, sessionID,
+				"UPDATE nfc_sessions SET printer_id = ?, toolhead_id = ?, location_name = ?, is_printer_location = ? WHERE session_id = ?",
+				nullableString(printerID), toolheadID, locationName, isPrinterLocation, sessionID,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("failed to update location in NFC session: %w", err)
@@ -186,12 +200,22 @@ func (b *FilamentBridge) createOrUpdateSession(sessionID string, spoolID int, pr
 
 // createNewSession creates a new NFC session
 func (b *FilamentBridge) createNewSession(sessionID string, spoolID int, printerName string, toolheadID int, locationName string, isPrinterLocation bool) (*NFCSession, error) {
+	var printerID string
+	if isPrinterLocation {
+		identity, err := b.resolvePrinterReference(printerName)
+		if err != nil {
+			return nil, err
+		}
+		printerID = identity.ID
+		printerName = identity.Name
+	}
 	now := time.Now()
 	expiresAt := now.Add(5 * time.Minute) // 5 minute expiration
 
 	session := &NFCSession{
 		SessionID:         sessionID,
 		SpoolID:           spoolID,
+		PrinterID:         printerID,
 		PrinterName:       printerName,
 		ToolheadID:        toolheadID,
 		LocationName:      locationName,
@@ -203,8 +227,8 @@ func (b *FilamentBridge) createNewSession(sessionID string, spoolID int, printer
 	}
 
 	_, err := b.db.Exec(
-		"INSERT INTO nfc_sessions (session_id, spool_id, printer_name, toolhead_id, location_name, is_printer_location, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-		session.SessionID, session.SpoolID, session.PrinterName, session.ToolheadID, session.LocationName, session.IsPrinterLocation, session.CreatedAt, session.ExpiresAt,
+		"INSERT INTO nfc_sessions (session_id, spool_id, printer_id, toolhead_id, location_name, is_printer_location, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		session.SessionID, session.SpoolID, nullableString(session.PrinterID), session.ToolheadID, session.LocationName, session.IsPrinterLocation, session.CreatedAt, session.ExpiresAt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create NFC session: %w", err)
@@ -217,9 +241,12 @@ func (b *FilamentBridge) createNewSession(sessionID string, spoolID int, printer
 func (b *FilamentBridge) getSession(sessionID string) (*NFCSession, error) {
 	var session NFCSession
 	err := b.db.QueryRow(
-		"SELECT session_id, spool_id, printer_name, toolhead_id, location_name, is_printer_location, created_at, expires_at FROM nfc_sessions WHERE session_id = ?",
+		`SELECT n.session_id, n.spool_id, COALESCE(n.printer_id, ''), COALESCE(p.name, ''),
+		 n.toolhead_id, n.location_name, n.is_printer_location, n.created_at, n.expires_at
+		 FROM nfc_sessions n LEFT JOIN printer_configs p ON p.printer_id = n.printer_id
+		 WHERE n.session_id = ?`,
 		sessionID,
-	).Scan(&session.SessionID, &session.SpoolID, &session.PrinterName,
+	).Scan(&session.SessionID, &session.SpoolID, &session.PrinterID, &session.PrinterName,
 		&session.ToolheadID, &session.LocationName, &session.IsPrinterLocation, &session.CreatedAt, &session.ExpiresAt)
 
 	if err != nil {
@@ -279,6 +306,7 @@ func (b *FilamentBridge) AssignSpoolToLocation(spoolID int, printerName string, 
 
 		log.Printf("Successfully assigned spool %d to %s toolhead %d", spoolID, printerName, toolheadID)
 	} else {
+		spoolman := b.spoolmanSnapshot()
 		// This is a non-printer location (drybox, storage, etc.)
 		// First, check if this spool is currently assigned to any toolhead and clear it
 		if err := b.clearSpoolFromAllToolheads(spoolID); err != nil {
@@ -291,12 +319,12 @@ func (b *FilamentBridge) AssignSpoolToLocation(spoolID int, printerName string, 
 		}
 
 		// Ensure the location exists in Spoolman
-		if _, err := b.spoolman.GetOrCreateLocation(locationName); err != nil {
+		if _, err := spoolman.GetOrCreateLocation(locationName); err != nil {
 			log.Printf("Warning: Failed to create/verify location '%s' in Spoolman: %v", locationName, err)
 		}
 
 		// Update Spoolman location
-		if err := b.spoolman.UpdateSpoolLocation(spoolID, locationName); err != nil {
+		if err := spoolman.UpdateSpoolLocation(spoolID, locationName); err != nil {
 			return fmt.Errorf("failed to update Spoolman location for spool %d: %w", spoolID, err)
 		}
 
@@ -315,14 +343,14 @@ func (b *FilamentBridge) clearSpoolFromAllToolheads(spoolID int) error {
 	}
 
 	// Find and clear any mappings for this spool
-	for printerName, printerMappings := range allMappings {
+	for printerID, printerMappings := range allMappings {
 		for toolheadID, mapping := range printerMappings {
 			if mapping.SpoolID == spoolID {
 				// Clear this toolhead mapping
-				if err := b.UnmapToolhead(printerName, toolheadID); err != nil {
-					log.Printf("Warning: Failed to unmap spool %d from %s toolhead %d: %v", spoolID, printerName, toolheadID, err)
+				if err := b.UnmapToolhead(printerID, toolheadID); err != nil {
+					log.Printf("Warning: Failed to unmap spool %d from %s toolhead %d: %v", spoolID, mapping.PrinterName, toolheadID, err)
 				} else {
-					log.Printf("Cleared spool %d from %s toolhead %d", spoolID, printerName, toolheadID)
+					log.Printf("Cleared spool %d from %s toolhead %d", spoolID, mapping.PrinterName, toolheadID)
 				}
 			}
 		}

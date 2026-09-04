@@ -5,412 +5,168 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to publish
+        required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
-  build:
-    name: Build and Release
+  test:
+    name: Full validation
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.23'
-
-      - name: Install cross-compilation tools
+          go-version: '1.26.6'
+          cache: true
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Validate release tag
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-mingw-w64
+          case "$RELEASE_TAG" in
+            v*) ;;
+            *) echo "Release tag must start with v: $RELEASE_TAG" >&2; exit 1 ;;
+          esac
+      - name: Check formatting
+        run: |
+          git ls-files -z '*.go' | xargs -0 gofmt -w
+          git diff --exit-code
+      - name: Vet
+        run: go vet ./...
+      - name: Test with race detector
+        run: go test -race ./...
+      - name: Check reachable vulnerabilities
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          govulncheck ./...
+      - name: Check browser JavaScript syntax
+        run: git ls-files -z 'static/js/*.js' | xargs -0 -n1 node --check
+      - name: Run browser smoke test
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npx --no-install playwright install --with-deps chromium
+          npm run test:browser
+      - name: Check release contracts
+        run: bash scripts/check-release-contract.sh
+      - name: Require verified real upstream evidence
+        run: bash scripts/verify-golden-fixtures.sh --release
 
-      - name: Build for Linux AMD64
+  build:
+    name: Build and smoke ${{ matrix.name }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            extension: ''
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            extension: ''
+          - name: darwin-amd64
+            runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            extension: ''
+          - name: darwin-arm64
+            runner: macos-15
+            goos: darwin
+            goarch: arm64
+            extension: ''
+          - name: windows-amd64
+            runner: windows-latest
+            goos: windows
+            goarch: amd64
+            extension: .exe
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: '1.26.6'
+          cache: true
+      - name: Build native artifact
+        shell: bash
         env:
-          CGO_ENABLED: 1
-          GOOS: linux
-          GOARCH: amd64
-        run: |
-          go build -o filabridge-linux-amd64 .
-          chmod +x filabridge-linux-amd64
+          CGO_ENABLED: '1'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -o "filabridge-${{ matrix.name }}${{ matrix.extension }}" .
+      - name: Smoke SQLite startup and HTTP readiness
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/smoke-release-artifact.sh "filabridge-${{ matrix.name }}${{ matrix.extension }}"
+      - name: Smoke SQLite startup and HTTP readiness on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/smoke-release-artifact.ps1 "filabridge-${{ matrix.name }}${{ matrix.extension }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: filabridge-${{ matrix.name }}
+          path: filabridge-${{ matrix.name }}${{ matrix.extension }}
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Build for Linux ARM64
-        env:
-          CGO_ENABLED: 1
-          GOOS: linux
-          GOARCH: arm64
-          CC: aarch64-linux-gnu-gcc
-        run: |
-          go build -o filabridge-linux-arm64 .
-          chmod +x filabridge-linux-arm64
+  docker:
+    name: Publish container image
+    needs: [test, build]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    secrets: inherit
 
-      - name: Build for Windows AMD64
-        env:
-          CGO_ENABLED: 1
-          GOOS: windows
-          GOARCH: amd64
-          CC: x86_64-w64-mingw32-gcc
+  release:
+    name: Publish release
+    needs: [test, build, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: filabridge-*
+          path: release-assets
+          merge-multiple: true
+      - name: Generate software bill of materials
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: release-assets
+          format: spdx-json
+          output-file: release-assets/filabridge-sbom.spdx.json
+          upload-artifact: false
+      - name: Generate checksums
         run: |
-          go build -o filabridge-windows-amd64.exe .
-
-      - name: Build for macOS AMD64
-        env:
-          CGO_ENABLED: 0
-          GOOS: darwin
-          GOARCH: amd64
-        run: |
-          go build -o filabridge-darwin-amd64 .
-          chmod +x filabridge-darwin-amd64
-
-      - name: Build for macOS ARM64
-        env:
-          CGO_ENABLED: 0
-          GOOS: darwin
-          GOARCH: arm64
-        run: |
-          go build -o filabridge-darwin-arm64 .
-          chmod +x filabridge-darwin-arm64
-
-      - name: Create checksums
-        run: |
+          cd release-assets
           sha256sum filabridge-* > checksums.txt
-          cat checksums.txt
-
-      - name: Extract version
-        id: get_version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-
-      - name: Generate changelog
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          echo "Generating changelog for version: $VERSION"
-          
-          # Get commits since last tag, excluding release commits
-          # Get all tags sorted by version, then find the one before current tag
-          CURRENT_TAG=${GITHUB_REF#refs/tags/}
-          LAST_TAG=$(git tag --sort=-version:refname | grep -A1 "^${CURRENT_TAG}$" | tail -n 1 || echo "")
-          if [ -z "$LAST_TAG" ] || [ "$LAST_TAG" = "$CURRENT_TAG" ]; then
-            # No previous tag found, get all commits
-            COMMITS=$(git log --pretty=format:"%s" HEAD)
-          else
-            COMMITS=$(git log --pretty=format:"%s" $LAST_TAG..HEAD)
-          fi
-          
-          # Initialize arrays for different commit types
-          declare -a FEATURES=()
-          declare -a FIXES=()
-          declare -a CHANGES=()
-          declare -a DOCS=()
-          declare -a OTHER=()
-          
-          # Process each commit
-          while IFS= read -r commit; do
-            # Skip automated changelog update commits
-            if [[ "$commit" =~ ^chore\(release\):\ update\ changelog\ for ]]; then
-              continue
-            fi
-            
-            # Categorize commits by conventional commit prefixes and strip prefixes properly
-            if [[ "$commit" =~ ^feat(\(.+\))?:\ (.+) ]]; then
-              # Extract message after "feat: " or "feat(scope): "
-              clean_commit="${commit#feat*: }"
-              FEATURES+=("- $clean_commit")
-            elif [[ "$commit" =~ ^(fix|bug)(\(.+\))?:\ (.+) ]]; then
-              # Remove both fix: and bug: prefixes (with optional scope)
-              if [[ "$commit" =~ ^fix ]]; then
-                clean_commit="${commit#fix*: }"
-              else
-                clean_commit="${commit#bug*: }"
-              fi
-              FIXES+=("- $clean_commit")
-            elif [[ "$commit" =~ ^(chore|refactor|style)(\(.+\))?:\ (.+) ]]; then
-              # Remove prefixes for different types (with optional scope)
-              if [[ "$commit" =~ ^chore ]]; then
-                clean_commit="${commit#chore*: }"
-              elif [[ "$commit" =~ ^refactor ]]; then
-                clean_commit="${commit#refactor*: }"
-              else
-                clean_commit="${commit#style*: }"
-              fi
-              CHANGES+=("- $clean_commit")
-            elif [[ "$commit" =~ ^docs(\(.+\))?:\ (.+) ]]; then
-              # Extract message after "docs: " or "docs(scope): "
-              clean_commit="${commit#docs*: }"
-              DOCS+=("- $clean_commit")
-            else
-              # Include any commit that doesn't match conventional commit format
-              OTHER+=("- $commit")
-            fi
-          done <<< "$COMMITS"
-          
-          # Read existing CHANGELOG.md if it exists
-          if [ -f "CHANGELOG.md" ]; then
-            # Find the first version entry line (starts with ## [)
-            FIRST_VERSION_LINE=$(grep -n "^## \[" CHANGELOG.md | head -n 1 | cut -d: -f1)
-            if [ -n "$FIRST_VERSION_LINE" ]; then
-              # Extract header (everything before first version entry) and body (rest)
-              head -n $((FIRST_VERSION_LINE - 1)) CHANGELOG.md > /tmp/header.txt
-              tail -n +$FIRST_VERSION_LINE CHANGELOG.md > /tmp/body.txt
-            else
-              # No version entries found, use entire file as body
-              printf '# Changelog\n\nAll notable changes to FilaBridge will be documented in this file.\n\nThe format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),\nand this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n\n' > /tmp/header.txt
-              cp CHANGELOG.md /tmp/body.txt
-            fi
-          else
-            # Create header if CHANGELOG.md doesn't exist
-            printf '# Changelog\n\nAll notable changes to FilaBridge will be documented in this file.\n\nThe format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),\nand this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n\n' > /tmp/header.txt
-            touch /tmp/body.txt
-          fi
-          
-          # Build the new version entry
-          printf '## [VERSION_PLACEHOLDER] - DATE_PLACEHOLDER\n\n' > /tmp/new_entry.txt
-          
-          # Replace placeholders in new entry
-          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" /tmp/new_entry.txt
-          sed -i "s/DATE_PLACEHOLDER/$(date +%Y-%m-%d)/g" /tmp/new_entry.txt
-          
-          # Add categorized sections
-          if [ ${#FEATURES[@]} -gt 0 ]; then
-            echo "### Added" >> /tmp/new_entry.txt
-            echo "" >> /tmp/new_entry.txt
-            printf '%s\n' "${FEATURES[@]}" >> /tmp/new_entry.txt
-            echo "" >> /tmp/new_entry.txt
-          fi
-          
-          if [ ${#FIXES[@]} -gt 0 ]; then
-            echo "### Fixed" >> /tmp/new_entry.txt
-            echo "" >> /tmp/new_entry.txt
-            printf '%s\n' "${FIXES[@]}" >> /tmp/new_entry.txt
-            echo "" >> /tmp/new_entry.txt
-          fi
-          
-          if [ ${#CHANGES[@]} -gt 0 ]; then
-            echo "### Changed" >> /tmp/new_entry.txt
-            echo "" >> /tmp/new_entry.txt
-            printf '%s\n' "${CHANGES[@]}" >> /tmp/new_entry.txt
-            echo "" >> /tmp/new_entry.txt
-          fi
-          
-          if [ ${#DOCS[@]} -gt 0 ]; then
-            echo "### Documentation" >> /tmp/new_entry.txt
-            echo "" >> /tmp/new_entry.txt
-            printf '%s\n' "${DOCS[@]}" >> /tmp/new_entry.txt
-            echo "" >> /tmp/new_entry.txt
-          fi
-          
-          if [ ${#OTHER[@]} -gt 0 ]; then
-            echo "### Other" >> /tmp/new_entry.txt
-            echo "" >> /tmp/new_entry.txt
-            printf '%s\n' "${OTHER[@]}" >> /tmp/new_entry.txt
-            echo "" >> /tmp/new_entry.txt
-          fi
-          
-          # Combine header + new entry + existing body
-          cat /tmp/header.txt /tmp/new_entry.txt /tmp/body.txt > CHANGELOG.md
-          
-          # Clean up temp files
-          rm -f /tmp/header.txt /tmp/body.txt /tmp/new_entry.txt
-          
-          # Show what was generated
-          echo "Generated changelog:"
-          cat CHANGELOG.md
-
-      - name: Commit updated changelog
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          
-          # Check if we're in detached HEAD and checkout main branch
-          if [ "$(git rev-parse --abbrev-ref HEAD)" = "HEAD" ]; then
-            echo "In detached HEAD state, checking out main branch"
-            git checkout main
-          fi
-          
-          git add CHANGELOG.md
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "chore(release): update changelog for ${{ github.ref_name }}"
-            git push origin main
-          fi
-
-      - name: Extract changelog for release notes
-        id: changelog
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          echo "Extracting changelog for release notes: $VERSION"
-          
-          # Get commits since last tag, excluding release commits
-          # Get all tags sorted by version, then find the one before current tag
-          CURRENT_TAG=${GITHUB_REF#refs/tags/}
-          LAST_TAG=$(git tag --sort=-version:refname | grep -A1 "^${CURRENT_TAG}$" | tail -n 1 || echo "")
-          if [ -z "$LAST_TAG" ] || [ "$LAST_TAG" = "$CURRENT_TAG" ]; then
-            # No previous tag found, get all commits
-            COMMITS=$(git log --pretty=format:"%s" HEAD)
-          else
-            COMMITS=$(git log --pretty=format:"%s" $LAST_TAG..HEAD)
-          fi
-          
-          # Initialize arrays for different commit types
-          declare -a FEATURES=()
-          declare -a FIXES=()
-          declare -a CHANGES=()
-          declare -a DOCS=()
-          declare -a OTHER=()
-          
-          # Process each commit
-          while IFS= read -r commit; do
-            # Skip automated changelog update commits
-            if [[ "$commit" =~ ^chore\(release\):\ update\ changelog\ for ]]; then
-              continue
-            fi
-            
-            # Categorize commits by conventional commit prefixes and strip prefixes properly
-            if [[ "$commit" =~ ^feat(\(.+\))?:\ (.+) ]]; then
-              # Extract message after "feat: " or "feat(scope): "
-              clean_commit="${commit#feat*: }"
-              FEATURES+=("- $clean_commit")
-            elif [[ "$commit" =~ ^(fix|bug)(\(.+\))?:\ (.+) ]]; then
-              # Remove both fix: and bug: prefixes (with optional scope)
-              if [[ "$commit" =~ ^fix ]]; then
-                clean_commit="${commit#fix*: }"
-              else
-                clean_commit="${commit#bug*: }"
-              fi
-              FIXES+=("- $clean_commit")
-            elif [[ "$commit" =~ ^(chore|refactor|style)(\(.+\))?:\ (.+) ]]; then
-              # Remove prefixes for different types (with optional scope)
-              if [[ "$commit" =~ ^chore ]]; then
-                clean_commit="${commit#chore*: }"
-              elif [[ "$commit" =~ ^refactor ]]; then
-                clean_commit="${commit#refactor*: }"
-              else
-                clean_commit="${commit#style*: }"
-              fi
-              CHANGES+=("- $clean_commit")
-            elif [[ "$commit" =~ ^docs(\(.+\))?:\ (.+) ]]; then
-              # Extract message after "docs: " or "docs(scope): "
-              clean_commit="${commit#docs*: }"
-              DOCS+=("- $clean_commit")
-            else
-              # Include any commit that doesn't match conventional commit format
-              OTHER+=("- $commit")
-            fi
-          done <<< "$COMMITS"
-          
-          # Build the changelog sections directly
-          CHANGELOG=""
-          
-          if [ ${#FEATURES[@]} -gt 0 ]; then
-            CHANGELOG="${CHANGELOG}### Added"$'\n'
-            for item in "${FEATURES[@]}"; do
-              CHANGELOG="${CHANGELOG}${item}"$'\n'
-            done
-            CHANGELOG="${CHANGELOG}"$'\n'
-          fi
-          
-          if [ ${#FIXES[@]} -gt 0 ]; then
-            CHANGELOG="${CHANGELOG}### Fixed"$'\n'
-            for item in "${FIXES[@]}"; do
-              CHANGELOG="${CHANGELOG}${item}"$'\n'
-            done
-            CHANGELOG="${CHANGELOG}"$'\n'
-          fi
-          
-          if [ ${#CHANGES[@]} -gt 0 ]; then
-            CHANGELOG="${CHANGELOG}### Changed"$'\n'
-            for item in "${CHANGES[@]}"; do
-              CHANGELOG="${CHANGELOG}${item}"$'\n'
-            done
-            CHANGELOG="${CHANGELOG}"$'\n'
-          fi
-          
-          if [ ${#DOCS[@]} -gt 0 ]; then
-            CHANGELOG="${CHANGELOG}### Documentation"$'\n'
-            for item in "${DOCS[@]}"; do
-              CHANGELOG="${CHANGELOG}${item}"$'\n'
-            done
-            CHANGELOG="${CHANGELOG}"$'\n'
-          fi
-          
-          if [ ${#OTHER[@]} -gt 0 ]; then
-            CHANGELOG="${CHANGELOG}### Other"$'\n'
-            for item in "${OTHER[@]}"; do
-              CHANGELOG="${CHANGELOG}${item}"$'\n'
-            done
-            CHANGELOG="${CHANGELOG}"$'\n'
-          fi
-          
-          # Remove trailing newlines (but keep at least one if content exists)
-          if [ -n "$CHANGELOG" ]; then
-            CHANGELOG=$(printf '%s' "$CHANGELOG" | sed -z 's/\n\+$//')
-          fi
-          
-          echo "Generated changelog:"
-          printf '%s' "$CHANGELOG"
-          echo ""
-          
-          # Output the changelog using multiline output syntax
-          # Use a variable to construct the delimiter line to avoid YAML parsing issues
-          DELIM="__CHANGELOG_END__"
-          # Construct the header line by concatenating parts
-          HEADER_LINE="CHANGELOG"
-          HEADER_LINE="${HEADER_LINE}<<"
-          HEADER_LINE="${HEADER_LINE}${DELIM}"
-          {
-            echo "${HEADER_LINE}"
-            printf '%s' "$CHANGELOG"
-            printf '\n%s\n' "${DELIM}"
-          } >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: |
-            filabridge-linux-amd64
-            filabridge-linux-arm64
-            filabridge-windows-amd64.exe
-            filabridge-darwin-amd64
-            filabridge-darwin-arm64
-            checksums.txt
-          body: |
-            # FilaBridge ${{ steps.get_version.outputs.VERSION }}
-            
-            ## Installation
-            
-            Download the appropriate binary for your platform:
-            
-            - **Linux (AMD64)**: `filabridge-linux-amd64`
-            - **Linux (ARM64)**: `filabridge-linux-arm64` (Raspberry Pi, etc.)
-            - **Windows (AMD64)**: `filabridge-windows-amd64.exe`
-            - **macOS (Intel)**: `filabridge-darwin-amd64`
-            - **macOS (Apple Silicon)**: `filabridge-darwin-arm64`
-            
-            ### Quick Start
-            
-            1. Download the binary for your platform
-            2. Make it executable (Linux/macOS): `chmod +x filabridge-*`
-            3. Run Spoolman: `docker run -d --name spoolman -p 8000:8000 ghcr.io/donkie/spoolman:latest`
-            4. Start FilaBridge: `./filabridge-*`
-            5. Open http://localhost:5000 and configure your printers
-            
-            ## Verify Downloads
-            
-            Verify your download using the checksums:
-            ```bash
-            sha256sum -c checksums.txt
-            ```
-            
-            ## What's New
-            ${{ steps.changelog.outputs.CHANGELOG }}
-            
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+          files: release-assets/*
+          tag_name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

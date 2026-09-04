@@ -1,158 +1,94 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 )
 
 func main() {
+	if err := run(context.Background(), os.Args[1:]); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run(parent context.Context, args []string) error {
+	if len(args) > 0 && args[0] == "profile-sync" {
+		return runProfileSync(parent, args[1:], os.Stdout, nil, nil)
+	}
+
 	// Command line flags
 	var (
-		webOnly    = flag.Bool("web-only", false, "Run only the web interface")
-		bridgeOnly = flag.Bool("bridge-only", false, "Run only the bridge service")
-		port       = flag.String("port", DefaultWebPort, "Web interface port")
-		host       = flag.String("host", "0.0.0.0", "Web interface host")
+		flags      = flag.NewFlagSet("filabridge", flag.ContinueOnError)
+		webOnly    = flags.Bool("web-only", false, "Run only the web interface")
+		bridgeOnly = flags.Bool("bridge-only", false, "Run only the bridge service")
+		port       = flags.String("port", DefaultWebPort, "Web interface port")
+		host       = flags.String("host", "127.0.0.1", "Web interface host")
 	)
-	flag.Parse()
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *webOnly && *bridgeOnly {
+		return fmt.Errorf("--web-only and --bridge-only cannot be used together")
+	}
 
 	// Create bridge instance first (with default config)
 	bridge, err := NewFilamentBridge(nil)
 	if err != nil {
-		log.Fatalf("Failed to create bridge: %v", err)
+		return fmt.Errorf("create bridge: %w", err)
 	}
 	defer bridge.Close()
 
 	// Load configuration from database
 	config, err := LoadConfig(bridge)
 	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+		return fmt.Errorf("load configuration: %w", err)
 	}
 
 	// Update bridge with loaded config
 	if err := bridge.UpdateConfig(config); err != nil {
-		log.Fatalf("Failed to update bridge config: %v", err)
+		return fmt.Errorf("update bridge config: %w", err)
 	}
-
-
 	// Override port from config if not specified
 	if *port == DefaultWebPort && config.WebPort != DefaultWebPort {
 		*port = config.WebPort
 	}
 
-	// Handle graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Start NFC session cleanup background task
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute) // Clean up every minute
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				if err := bridge.cleanupExpiredSessions(); err != nil {
-					log.Printf("Error cleaning up NFC sessions: %v", err)
-				}
-			case <-sigChan:
-				return
-			}
-		}
-	}()
-
+	mode := RuntimeModeCombined
 	if *webOnly {
-		// Run only web interface
-		fmt.Println("Starting web interface only...")
-		webServer := NewWebServer(bridge)
-		go func() {
-			if err := webServer.Start(*port); err != nil {
-				log.Fatalf("Web server error: %v", err)
-			}
-		}()
-
-		// Wait for shutdown signal
-		<-sigChan
-		fmt.Println("Shutting down web server...")
-
+		mode = RuntimeModeWebOnly
 	} else if *bridgeOnly {
-		// Run only bridge service
-		fmt.Println("Starting bridge service only...")
-		fmt.Printf("Monitoring printers: %v\n", getPrinterNames(config))
-		fmt.Printf("Spoolman URL: %s\n", config.SpoolmanURL)
-		fmt.Printf("Poll interval: %v\n", config.PollInterval)
-
-		// Start monitoring in a goroutine
-		go func() {
-			ticker := time.NewTicker(config.PollInterval)
-			defer ticker.Stop()
-
-			// Run initial check
-			bridge.MonitorPrinters()
-
-			// Continue monitoring
-			for {
-				select {
-				case <-ticker.C:
-					bridge.MonitorPrinters()
-				case <-sigChan:
-					return
-				}
-			}
-		}()
-
-		// Wait for shutdown signal
-		<-sigChan
-		fmt.Println("Shutting down bridge service...")
-
-	} else {
-		// Run both bridge service and web interface
-		fmt.Println("Starting both bridge service and web interface...")
-		fmt.Printf("Monitoring printers: %v\n", getPrinterNames(config))
-		fmt.Printf("Spoolman URL: %s\n", config.SpoolmanURL)
-		fmt.Printf("Poll interval: %v\n", config.PollInterval)
-		fmt.Printf("Web interface: http://%s:%s\n", *host, *port)
-
-		// Create web server first so we can pass it to monitoring
-		webServer := NewWebServer(bridge)
-
-		// Start bridge monitoring in a goroutine
-		go func() {
-			ticker := time.NewTicker(config.PollInterval)
-			defer ticker.Stop()
-
-			// Run initial check
-			bridge.MonitorPrinters()
-			// Broadcast initial status
-			webServer.BroadcastStatus()
-
-			// Continue monitoring
-			for {
-				select {
-				case <-ticker.C:
-					bridge.MonitorPrinters()
-					// Broadcast status after each monitoring cycle
-					webServer.BroadcastStatus()
-				case <-sigChan:
-					return
-				}
-			}
-		}()
-
-		// Start web server in a goroutine
-		go func() {
-			if err := webServer.Start(*port); err != nil {
-				log.Fatalf("Web server error: %v", err)
-			}
-		}()
-
-		// Wait for shutdown signal
-		<-sigChan
-		fmt.Println("Shutting down services...")
+		mode = RuntimeModeBridgeOnly
 	}
+
+	var webServer *WebServer
+	if mode != RuntimeModeBridgeOnly {
+		webServer = NewWebServerForHost(bridge, *host)
+	}
+	runtime, err := NewApplicationRuntime(bridge, webServer, RuntimeOptions{
+		Mode: mode,
+		Host: *host,
+		Port: *port,
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Mode: %s\n", mode)
+	fmt.Printf("Monitoring printers: %v\n", getPrinterNames(config))
+	fmt.Printf("Spoolman URL: %s\n", config.SpoolmanURL)
+	fmt.Printf("Poll interval: %v\n", config.PollInterval)
+	if mode != RuntimeModeBridgeOnly {
+		fmt.Printf("Web interface: http://%s\n", runtime.options.ListenAddress())
+	}
+
+	ctx, stop := signal.NotifyContext(parent, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return runtime.Run(ctx)
 }
 
 // getPrinterNames returns a slice of printer names from config

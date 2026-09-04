@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Dunky13/filabridge/testdata/compatibility/golden-fixture.schema.json",
+  "title": "FilaBridge real upstream compatibility evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "release_evidence_requirements",
+    "prusaslicer_artifacts",
+    "firmware_captures",
+    "hardware_verifications"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "release_evidence_requirements": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["printer_family", "printer_model", "preview"],
+        "properties": {
+          "printer_family": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
+          "printer_model": { "type": "string", "minLength": 1 },
+          "preview": { "type": "boolean" }
+        }
+      }
+    },
+    "prusaslicer_artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id", "artifact_path", "sha256", "source", "format",
+          "printer_model", "toolheads", "used_toolheads", "production",
+          "expected_grams_by_logical_tool", "verification"
+        ],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "artifact_path": { "type": "string", "pattern": "^testdata/compatibility/golden/" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "source": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["version", "commit", "download_url", "preset_id"],
+            "properties": {
+              "version": { "type": "string", "minLength": 1 },
+              "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+              "download_url": { "type": "string", "format": "uri", "pattern": "^https://" },
+              "preset_id": { "type": "string", "minLength": 1 }
+            }
+          },
+          "format": { "enum": ["gcode", "bgcode"] },
+          "printer_model": { "type": "string", "minLength": 1 },
+          "toolheads": { "type": "integer", "minimum": 1 },
+          "used_toolheads": { "type": "integer", "minimum": 1 },
+          "production": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["producer", "producer_commit"],
+            "properties": {
+              "producer": { "enum": ["prusaslicer", "libbgcode"] },
+              "producer_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+              "input_artifact_id": { "type": "string", "minLength": 1 }
+            },
+            "allOf": [
+              {
+                "if": { "properties": { "producer": { "const": "libbgcode" } } },
+                "then": { "required": ["input_artifact_id"] },
+                "else": { "not": { "required": ["input_artifact_id"] } }
+              }
+            ]
+          },
+          "expected_grams_by_logical_tool": {
+            "type": "object",
+            "additionalProperties": { "type": "number", "minimum": 0 }
+          },
+          "verification": { "$ref": "#/$defs/verification" }
+        }
+      }
+    },
+    "firmware_captures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id", "capture_path", "sha256", "firmware_version", "release_url", "printer_family", "printer_model",
+          "endpoints", "sanitized", "verification"
+        ],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "capture_path": { "type": "string", "pattern": "^testdata/compatibility/golden/" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "firmware_version": { "type": "string", "minLength": 1 },
+          "release_url": { "type": "string", "format": "uri", "pattern": "^https://" },
+          "printer_family": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
+          "printer_model": { "type": "string", "minLength": 1 },
+          "endpoints": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "sanitized": { "const": true },
+          "verification": { "$ref": "#/$defs/verification" }
+        }
+      }
+    },
+    "hardware_verifications": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "prusaslicer_version", "firmware_version", "printer_family", "printer_model", "evidence_path", "sha256", "ascii_print",
+          "bgcode_print", "accounting_verified", "restart_reconciliation_verified",
+          "verified_by", "verified_at"
+        ],
+        "properties": {
+          "prusaslicer_version": { "type": "string", "minLength": 1 },
+          "firmware_version": { "type": "string", "minLength": 1 },
+          "printer_family": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
+          "printer_model": { "type": "string", "minLength": 1 },
+          "evidence_path": { "type": "string", "pattern": "^testdata/compatibility/golden/" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "ascii_print": { "const": true },
+          "bgcode_print": { "const": true },
+          "accounting_verified": { "const": true },
+          "restart_reconciliation_verified": { "const": true },
+          "verified_by": { "type": "string", "minLength": 1 },
+          "verified_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verified_by", "verified_at"],
+      "properties": {
+        "verified_by": { "type": "string", "minLength": 1 },
+        "verified_at": { "type": "string", "format": "date-time" },
+        "notes": { "type": "string" }
+      }
+    }
+  }
+}

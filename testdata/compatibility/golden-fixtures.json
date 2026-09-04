@@ -1,0 +1,118 @@
+{
+  "schema_version": 2,
+  "release_evidence_requirements": [
+    {
+      "printer_family": "COREONE",
+      "printer_model": "Prusa CORE One",
+      "preview": false
+    },
+    {
+      "printer_family": "COREONE_INDX",
+      "printer_model": "Prusa CORE One INDX 8T",
+      "preview": false
+    },
+    {
+      "printer_family": "COREONEL",
+      "printer_model": "Prusa CORE One L",
+      "preview": false
+    },
+    {
+      "printer_family": "COREONEL_INDX",
+      "printer_model": "Prusa CORE One L INDX 8T",
+      "preview": true
+    }
+  ],
+  "prusaslicer_artifacts": [
+    {
+      "id": "prusaslicer-3.0.0-alpha11-core-one-gcode",
+      "artifact_path": "testdata/compatibility/golden/prusaslicer-3.0.0-alpha11-core-one.gcode",
+      "sha256": "a372e94b083a495234ec4464df73aff1d0a6690dbec9e75e4afd4174e6b930fb",
+      "source": {
+        "version": "version_3.0.0-alpha11",
+        "commit": "6f510128d7c2e543b62919b74bea7e876f564205",
+        "download_url": "https://github.com/prusa3d/PrusaSlicer/releases/download/version_3.0.0-alpha11/PrusaSlicer-3.0.0-alpha11.dmg",
+        "preset_id": "Prusa CORE One 0.4 HF"
+      },
+      "format": "gcode",
+      "printer_model": "Prusa CORE One",
+      "toolheads": 1,
+      "used_toolheads": 1,
+      "production": {
+        "producer": "prusaslicer",
+        "producer_commit": "6f510128d7c2e543b62919b74bea7e876f564205"
+      },
+      "expected_grams_by_logical_tool": {
+        "0": 3.77
+      },
+      "verification": {
+        "verified_by": "Codex compatibility run",
+        "verified_at": "2026-09-04T09:37:56Z",
+        "notes": "Sliced from source-cube.stl with the official release asset after its published SHA-256 matched; the embedded metadata reports 3.77 g."
+      }
+    },
+    {
+      "id": "prusaslicer-3.0.0-alpha11-core-one-bgcode",
+      "artifact_path": "testdata/compatibility/golden/prusaslicer-3.0.0-alpha11-core-one.bgcode",
+      "sha256": "6a70d52eeb1b3376c95a60c4b7c343eca7ea3523a63b7155fbcb92fa92d51d2a",
+      "source": {
+        "version": "version_3.0.0-alpha11",
+        "commit": "6f510128d7c2e543b62919b74bea7e876f564205",
+        "download_url": "https://github.com/prusa3d/PrusaSlicer/releases/download/version_3.0.0-alpha11/PrusaSlicer-3.0.0-alpha11.dmg",
+        "preset_id": "Prusa CORE One 0.4 HF"
+      },
+      "format": "bgcode",
+      "printer_model": "Prusa CORE One",
+      "toolheads": 1,
+      "used_toolheads": 1,
+      "production": {
+        "producer": "libbgcode",
+        "producer_commit": "d4da9073616d70a43c151e8c1d7fbff879d2e08a",
+        "input_artifact_id": "prusaslicer-3.0.0-alpha11-core-one-gcode"
+      },
+      "expected_grams_by_logical_tool": {
+        "0": 3.77
+      },
+      "verification": {
+        "verified_by": "Codex compatibility run",
+        "verified_at": "2026-09-04T09:37:56Z",
+        "notes": "The alpha11 ASCII export was encoded and round-trip decoded with libbgcode d4da9073616d70a43c151e8c1d7fbff879d2e08a, the exact revision pinned by alpha11."
+      }
+    },
+    {
+      "id": "prusaslicer-3.0.0-alpha11-core-one-indx-8t-gcode",
+      "artifact_path": "testdata/compatibility/golden/prusaslicer-3.0.0-alpha11-core-one-indx-8t.gcode",
+      "sha256": "fd79cfa319dad6af0c507ff55d8a9d4441808efb8efff8c29baf7961c81c1e09",
+      "source": {
+        "version": "version_3.0.0-alpha11",
+        "commit": "6f510128d7c2e543b62919b74bea7e876f564205",
+        "download_url": "https://github.com/prusa3d/PrusaSlicer/releases/download/version_3.0.0-alpha11/PrusaSlicer-3.0.0-alpha11.dmg",
+        "preset_id": "Prusa CORE One INDX 8T 0.4 HF, 0.4 HF, 0.4 HF, 0.4 HF, 0.4 HF, 0.4 HF, 0.4 HF, 0.4 HF"
+      },
+      "format": "gcode",
+      "printer_model": "Prusa CORE One INDX 8T",
+      "toolheads": 8,
+      "used_toolheads": 1,
+      "production": {
+        "producer": "prusaslicer",
+        "producer_commit": "6f510128d7c2e543b62919b74bea7e876f564205"
+      },
+      "expected_grams_by_logical_tool": {
+        "0": 3.74,
+        "1": 0,
+        "2": 0,
+        "3": 0,
+        "4": 0,
+        "5": 0,
+        "6": 0,
+        "7": 0
+      },
+      "verification": {
+        "verified_by": "Codex compatibility run",
+        "verified_at": "2026-09-04T09:37:56Z",
+        "notes": "Sliced with the official eight-extruder INDX profile; metadata identifies COREONE_INDX8T and contains a strict eight-slot vector. Only logical tool 0 is used, so this is profile/cardinality evidence, not a real multi-tool-consumption claim."
+      }
+    }
+  ],
+  "firmware_captures": [],
+  "hardware_verifications": []
+}

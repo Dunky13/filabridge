@@ -110,33 +110,52 @@ function loadConfiguration() {
         .then(response => response.json())
         .then(config => {
             const form = document.getElementById('config-form');
+            // Keep remote configuration values out of HTML parsing sinks. Build
+            // static markup first, then assign data through DOM properties.
             form.innerHTML = `
                 <div style="max-width: 600px; margin: 0 auto;">
                     <div class="form-group">
                         <label><strong>Spoolman URL:</strong></label>
-                        <input type="text" id="spoolman_url" value="${config.spoolman_url || ''}" placeholder="http://localhost:8000">
+                        <input type="text" id="spoolman_url" placeholder="http://localhost:8000">
                         <small>URL where Spoolman is running</small>
                     </div>
                     <div class="form-group">
                         <label><strong>Spoolman Username (optional):</strong></label>
-                        <input type="text" id="spoolman_username" value="${config.spoolman_username || ''}" placeholder="Leave empty if not using basic auth">
+                        <input type="text" id="spoolman_username" placeholder="Leave empty if not using basic auth">
                         <small>Username for Spoolman basic authentication (optional)</small>
                     </div>
                     <div class="form-group">
                         <label><strong>Spoolman Password (optional):</strong></label>
-                        <input type="password" id="spoolman_password" value="${config.spoolman_password || ''}" placeholder="Leave empty if not using basic auth">
-                        <small>Password for Spoolman basic authentication (optional)</small>
+                        <input type="password" id="spoolman_password" autocomplete="new-password" placeholder="Leave blank to keep the stored password">
+                        <small id="spoolman_password_status"></small>
+                        <label><input type="checkbox" id="clear_spoolman_password"> Clear stored Spoolman password</label>
                     </div>
                     <div class="form-group">
                         <label><strong>Poll Interval (seconds):</strong></label>
-                        <input type="number" id="poll_interval" value="${config.poll_interval || '30'}" min="10" max="300">
+                        <input type="number" id="poll_interval" min="10" max="300">
                         <small>How often to check printer status</small>
+                    </div>
+                    <div class="form-group">
+                        <label><strong>Consumption Authority:</strong></label>
+                        <select id="consumption_authority">
+                            <option value="spoolman-led">Spoolman-led (automatic job debit)</option>
+                            <option value="tag-led">OpenPrintTag-led (observe jobs only)</option>
+                            <option value="observed-only">Observed only (no automatic debit)</option>
+                        </select>
+                        <small>Exactly one system may author consumption; this prevents double deductions.</small>
                     </div>
                     <div style="margin-top: 20px; text-align: center;">
                         <button class="btn" onclick="saveConfiguration()">💾 Save Configuration</button>
                     </div>
                 </div>
             `;
+            document.getElementById('spoolman_url').value = config.spoolman_url || '';
+            document.getElementById('spoolman_username').value = config.spoolman_username || '';
+            document.getElementById('poll_interval').value = config.poll_interval || '30';
+            document.getElementById('consumption_authority').value = config.consumption_authority || 'spoolman-led';
+            document.getElementById('spoolman_password_status').textContent = config.spoolman_password_configured
+                ? 'A password is configured. Leave blank to keep it.'
+                : 'No password is configured.';
         })
         .catch(error => {
             console.error('Error loading configuration:', error);
@@ -149,7 +168,9 @@ function saveConfiguration() {
         spoolman_url: document.getElementById('spoolman_url').value,
         spoolman_username: document.getElementById('spoolman_username').value,
         spoolman_password: document.getElementById('spoolman_password').value,
-        poll_interval: document.getElementById('poll_interval').value
+        clear_spoolman_password: document.getElementById('clear_spoolman_password').checked,
+        poll_interval: Number(document.getElementById('poll_interval').value),
+        consumption_authority: document.getElementById('consumption_authority').value
     };
     
     fetch('/api/config', {
@@ -187,9 +208,9 @@ function loadAdvancedSettings() {
 
 function saveAdvancedSettings() {
     const config = {
-        prusalink_timeout: document.getElementById('prusalinkTimeout').value,
-        prusalink_file_download_timeout: document.getElementById('prusalinkFileDownloadTimeout').value,
-        spoolman_timeout: document.getElementById('spoolmanTimeout').value
+        prusalink_timeout: Number(document.getElementById('prusalinkTimeout').value),
+        prusalink_file_download_timeout: Number(document.getElementById('prusalinkFileDownloadTimeout').value),
+        spoolman_timeout: Number(document.getElementById('spoolmanTimeout').value)
     };
     
     // Validate inputs
