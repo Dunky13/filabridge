@@ -3,6 +3,12 @@ name: Promote Latest Container
 on:
   release:
     types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to promote
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -16,15 +22,22 @@ concurrency:
 
 jobs:
   promote:
-    if: github.event.release.draft == false && github.event.release.prerelease == false
+    # On a direct release event, only stable, non-draft releases promote. When
+    # called from the release pipeline (workflow_call), the caller only reaches
+    # this after publishing a real release, so the draft/prerelease guard does
+    # not apply. github.event_name reflects the caller's original trigger (push
+    # or workflow_dispatch), never 'release', on the workflow_call path.
+    if: >-
+      github.event_name != 'release' ||
+      (github.event.release.draft == false && github.event.release.prerelease == false)
     runs-on: ubuntu-latest
     env:
-      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
     steps:
       - name: Checkout release tags
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
       - name: Re-check rolling latest eligibility
         id: promotion
