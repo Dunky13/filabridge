@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.3.3] - 2026-09-09
+
+### Fixed
+
+- Promote the rolling `latest` container tag from within the release pipeline. A release created with the workflow `GITHUB_TOKEN` cannot trigger the standalone promotion workflow, so `latest` previously required a manual step.
+
 ## [v0.3.2] - 2026-09-09
 
 ### Added
