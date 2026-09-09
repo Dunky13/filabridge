@@ -4,17 +4,17 @@
     {
       "printer_family": "COREONE",
       "printer_model": "Prusa CORE One",
-      "preview": false
+      "preview": true
     },
     {
       "printer_family": "COREONE_INDX",
       "printer_model": "Prusa CORE One INDX 8T",
-      "preview": false
+      "preview": true
     },
     {
       "printer_family": "COREONEL",
       "printer_model": "Prusa CORE One L",
-      "preview": false
+      "preview": true
     },
     {
       "printer_family": "COREONEL_INDX",

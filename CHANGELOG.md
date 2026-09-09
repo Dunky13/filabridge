@@ -7,10 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.3.2] - 2026-09-09
+
 ### Added
 
 - Deterministic PrusaSlicer 3 filament-profile export from active Spoolman filament definitions.
 - Authenticated profile-bundle endpoint and cross-platform `profile-sync` command in the release binary.
+- Prusa CORE One family support (CORE One, INDX 8T, CORE One L) as **preview**: parser, profile-sync, and mocked-protocol behavior are tested, but no hardware attestation exists yet. Rows are promoted to stable only after sanitized firmware captures and physical-printer gates are added.
 
 ## [v0.3.1] - 2026-04-25
 

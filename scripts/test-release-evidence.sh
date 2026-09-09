@@ -10,10 +10,22 @@ fixture_hash="$(jq -er '.prusaslicer_artifacts[] | select(.id == "prusaslicer-3.
 temporary_manifest="$(mktemp "${TMPDIR:-/tmp}/filabridge-release-evidence.XXXXXX.json")"
 trap 'rm -f "$temporary_manifest"' EXIT
 
+# The self-test validates gate logic, not the shipped preview flags, so it pins
+# its own requirement set: two stable rows that must block until satisfied and
+# one preview row that must never block. This stays meaningful even when every
+# shipped row is preview (no maintainer hardware access).
+synthetic_requirements='[
+  {"printer_family": "COREONE", "printer_model": "Prusa CORE One", "preview": false},
+  {"printer_family": "COREONE_INDX", "printer_model": "Prusa CORE One INDX 8T", "preview": false},
+  {"printer_family": "COREONEL_INDX", "printer_model": "Prusa CORE One L INDX 8T", "preview": true}
+]'
+
 write_test_evidence() {
   local family="$1"
   local model="$2"
-  jq --arg family "$family" --arg model "$model" --arg path "$fixture_path" --arg sha "$fixture_hash" '
+  jq --arg family "$family" --arg model "$model" --arg path "$fixture_path" --arg sha "$fixture_hash" \
+    --argjson requirements "$synthetic_requirements" '
+    .release_evidence_requirements = $requirements |
     .firmware_captures = [{
       id: "synthetic-gate-test-capture",
       capture_path: $path,
@@ -73,7 +85,8 @@ write_test_evidence "COREONE" "Prusa CORE One"
 assert_blocked_by "COREONE_INDX Prusa CORE One INDX 8T"
 
 # Preview-only models are schema-validated but do not block stable releases.
-jq --arg path "$fixture_path" --arg sha "$fixture_hash" '
+jq --arg path "$fixture_path" --arg sha "$fixture_hash" --argjson requirements "$synthetic_requirements" '
+  .release_evidence_requirements = $requirements |
   .firmware_captures = [.release_evidence_requirements[] | select(.preview == false) | {
     id: ("stable-gate-test-" + .printer_family),
     capture_path: $path,
