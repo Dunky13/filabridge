@@ -170,3 +170,16 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           fail_on_unmatched_files: true
+
+  promote-latest:
+    name: Promote rolling latest tag
+    # A release created with GITHUB_TOKEN does not emit a release event that can
+    # trigger promote-latest.yml, so the pipeline calls it directly here.
+    needs: [release]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/promote-latest.yml
+    with:
+      tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    secrets: inherit
