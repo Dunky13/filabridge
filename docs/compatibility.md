@@ -38,9 +38,15 @@ structure, producer lineage, logical-tool cardinality, and every checksum. The
 tagged-release workflow additionally requires the currently pinned slicer to
 have a real ASCII export, an honestly attributed BGCode, and an eight-slot
 PrusaSlicer export. It then requires matching firmware captures and physical
-gates for COREONE, COREONE_INDX, COREONEL, and preview COREONEL_INDX family/model
-rows. Stable releases require the non-preview rows; preview rows remain
-schema-validated but nonblocking until promoted to supported. Evidence for an
-unrelated printer cannot unblock a row. Until every required stable row exists,
-release publication is intentionally blocked. See
+gates for every non-preview family/model row. Stable releases require the
+non-preview rows; preview rows remain schema-validated but nonblocking until
+promoted to supported. Evidence for an unrelated printer cannot unblock a row.
+Until every required stable row exists, release publication is intentionally
+blocked.
+
+All CORE One family rows (COREONE, COREONE_INDX, COREONEL, COREONEL_INDX) are
+currently preview: their parser, profile-sync, and mocked-protocol behavior are
+tested, but no maintainer has physical-printer access to produce the sanitized
+firmware captures and hardware attestations. A row is promoted to non-preview
+(stable) only after its capture and physical gate exist. See
 `testdata/compatibility/README.md` for the capture procedure.
