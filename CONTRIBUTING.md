@@ -98,7 +98,7 @@ This format helps us automatically generate changelogs and determine semantic ve
 ### Prerequisites
 
 - Go 1.25 or higher
-- Node.js 24 (for the Playwright browser smoke test)
+- Node.js 26.12.1 (for the Playwright browser smoke test)
 - Docker (for testing with Spoolman)
 - A PrusaLink-compatible printer (or mock for testing)
 
