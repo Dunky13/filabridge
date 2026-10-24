@@ -59,7 +59,7 @@ not advance the pinned slicer, firmware, or Spoolman versions.
    #15 normally. Recheck the merged `main` commit and any required merge checks.
 2. Recheck that `v0.3.4` does not exist as either a tag or a GitHub release. Verify
    every PR commit's configured author, matching DCO trailer, and valid signature.
-3. Run the release preflight and retain its exact commit. Create an annotated,
+3. Run the read-only preflight below and retain its exact commit. Create an annotated,
    GPG-signed `v0.3.4` tag on that qualified merged commit. Verify its signature,
    then push only that tag. Do not create a GitHub release manually.
 4. Follow the tag-triggered Release workflow through full validation, all five
@@ -69,6 +69,43 @@ not advance the pinned slicer, firmware, or Spoolman versions.
    versioned manifest (Linux amd64 and arm64), provenance and SBOM attestations,
    and promoted `latest` digest. Download artifacts and verify checksums and the
    relevant target runtime before claiming artifact acceptance.
+
+After merging, check out the merged commit in a clean checkout. Export
+`FILABRIDGE_REVIEWED_HEAD` with the exact PR head from the completed review and
+qualification handoff. With authenticated `gh`, repository access, and the
+signer's public key available, run this Bash block from that checkout:
+
+```bash
+bash -eu <<'SH'
+: "${FILABRIDGE_REVIEWED_HEAD:?Export the exact qualified PR head first}"
+repo=Dunky13/filabridge
+tag=v0.3.4
+base=5c90003308b282c9e2bf67206f7f13a1a250c4d5
+test -z "$(git status --porcelain)"
+test "$(gh api "repos/$repo/pulls/15" --jq .merged)" = true
+test "$(gh api "repos/$repo/pulls/15" --jq .head.sha)" = "$FILABRIDGE_REVIEWED_HEAD"
+merged_commit="$(gh api "repos/$repo/pulls/15" --jq .merge_commit_sha)"
+test "$(git rev-parse HEAD)" = "$merged_commit"
+test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$merged_commit"
+git merge-base --is-ancestor "$FILABRIDGE_REVIEWED_HEAD" "$merged_commit"
+for commit in $(git rev-list "$base..$FILABRIDGE_REVIEWED_HEAD"); do
+  test "$(git show -s --format='%an <%ae>' "$commit")" = 'Marc Went <marc@went.io>'
+  git show -s --format=%B "$commit" | grep -Fx 'Signed-off-by: Marc Went <marc@went.io>'
+  git verify-commit "$commit"
+done
+test -z "$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}")"
+test "$(gh api --paginate --slurp "repos/$repo/releases?per_page=100" \
+  --jq '[.[][] | select(.tag_name == "v0.3.4")] | length')" = 0
+test "$(gh api "repos/$repo" --jq .permissions.push)" = true
+bash scripts/check-release-contract.sh
+bash scripts/verify-golden-fixtures.sh --release
+printf 'Preflight passed for %s at %s\n' "$tag" "$merged_commit"
+SH
+```
+
+The block exits nonzero on any missing prerequisite or changed identity. It does
+not sign, tag, publish, dispatch, or prove hosted CI success. The parent must
+separately verify the reviewed head's checks and required merge checks in step 1.
 
 The release workflow builds on Linux amd64/arm64, macOS amd64/arm64, and Windows
 amd64 runners because SQLite requires CGO. A build on another architecture or

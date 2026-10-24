@@ -85,7 +85,7 @@ _Location management interface for creating printer toolhead and storage locatio
 - A PrusaLink-compatible 3D printer (Prusa or any printer with PrusaLink API)
 - PrusaLink enabled on your printer(s) for local network access
 - Spoolman
-- **For building from source**: Go 1.25 or higher
+- **For building from source**: Go 1.26.10 or higher
 - **(Optional) For NFC features**: NFC-capable smartphone and NFC tags (NTAG213/215/216 recommended)
 - **(Recommendation) NFC Tools Pro** mobile app (for programming tags)
 
