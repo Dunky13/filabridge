@@ -1,7 +1,7 @@
 # FilaBridge
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Go Version](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.26.10%2B-00ADD8?logo=go)](https://go.dev/)
 [![GitHub release](https://img.shields.io/github/v/release/Dunky13/filabridge)](https://github.com/Dunky13/filabridge/releases)
 
 Manual release and container workflow runs publish the requested immutable
@@ -85,7 +85,7 @@ _Location management interface for creating printer toolhead and storage locatio
 - A PrusaLink-compatible 3D printer (Prusa or any printer with PrusaLink API)
 - PrusaLink enabled on your printer(s) for local network access
 - Spoolman
-- **For building from source**: Go 1.25 or higher
+- **For building from source**: Go 1.26.10 or higher
 - **(Optional) For NFC features**: NFC-capable smartphone and NFC tags (NTAG213/215/216 recommended)
 - **(Recommendation) NFC Tools Pro** mobile app (for programming tags)
 
