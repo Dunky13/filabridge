@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.3.4] - 2026-10-24
+
+### Security
+
+- Build CI, release artifacts, and container images with Go 1.26.10, including the crypto/x509 certificate distrust update and current standard-library security fixes.
+- Update golang.org/x/net and its required companion modules to remove reachable HTTP/2 vulnerabilities.
+- Use Node.js 26.12.1 for local browser tooling and all browser validation workflows.
+
 ## [v0.3.3] - 2026-09-09
 
 ### Fixed
