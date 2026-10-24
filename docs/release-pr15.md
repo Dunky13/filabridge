@@ -76,31 +76,40 @@ qualification handoff. With authenticated `gh`, repository access, and the
 signer's public key available, run this Bash block from that checkout:
 
 ```bash
-bash -eu <<'SH'
+bash -euo pipefail <<'SH'
 : "${FILABRIDGE_REVIEWED_HEAD:?Export the exact qualified PR head first}"
 repo=Dunky13/filabridge
 tag=v0.3.4
 base=5c90003308b282c9e2bf67206f7f13a1a250c4d5
 working_tree="$(git status --porcelain)"
 test -z "$working_tree"
-test "$(gh api "repos/$repo/pulls/15" --jq .merged)" = true
-test "$(gh api "repos/$repo/pulls/15" --jq .head.sha)" = "$FILABRIDGE_REVIEWED_HEAD"
+pr_merged="$(gh api "repos/$repo/pulls/15" --jq .merged)"
+test "$pr_merged" = true
+pr_head="$(gh api "repos/$repo/pulls/15" --jq .head.sha)"
+test "$pr_head" = "$FILABRIDGE_REVIEWED_HEAD"
 merged_commit="$(gh api "repos/$repo/pulls/15" --jq .merge_commit_sha)"
-test "$(git rev-parse HEAD)" = "$merged_commit"
-test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$merged_commit"
+checkout_head="$(git rev-parse HEAD)"
+test "$checkout_head" = "$merged_commit"
+main_refs="$(git ls-remote origin refs/heads/main)"
+main_head="$(printf '%s' "$main_refs" | awk '{print $1}')"
+test "$main_head" = "$merged_commit"
 git merge-base --is-ancestor "$FILABRIDGE_REVIEWED_HEAD" "$merged_commit"
 commits="$(git rev-list "$base..$FILABRIDGE_REVIEWED_HEAD")"
 test -n "$commits"
 for commit in $commits; do
-  test "$(git show -s --format='%an <%ae>' "$commit")" = 'Marc Went <marc@went.io>'
-  git show -s --format=%B "$commit" | grep -Fx 'Signed-off-by: Marc Went <marc@went.io>'
+  author="$(git show -s --format='%an <%ae>' "$commit")"
+  test "$author" = 'Marc Went <marc@went.io>'
+  message="$(git show -s --format=%B "$commit")"
+  printf '%s\n' "$message" | grep -Fx 'Signed-off-by: Marc Went <marc@went.io>'
   git verify-commit "$commit"
 done
 tag_refs="$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}")"
 test -z "$tag_refs"
 releases="$(gh api --paginate --slurp "repos/$repo/releases?per_page=100")"
-test "$(printf '%s' "$releases" | jq '[.[][] | select(.tag_name == "v0.3.4")] | length')" = 0
-test "$(gh api "repos/$repo" --jq .permissions.push)" = true
+release_count="$(printf '%s' "$releases" | jq '[.[][] | select(.tag_name == "v0.3.4")] | length')"
+test "$release_count" = 0
+push_permission="$(gh api "repos/$repo" --jq .permissions.push)"
+test "$push_permission" = true
 bash scripts/check-release-contract.sh
 bash scripts/verify-golden-fixtures.sh --release
 printf 'Preflight passed for %s at %s\n' "$tag" "$merged_commit"
