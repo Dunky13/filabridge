@@ -81,21 +81,25 @@ bash -eu <<'SH'
 repo=Dunky13/filabridge
 tag=v0.3.4
 base=5c90003308b282c9e2bf67206f7f13a1a250c4d5
-test -z "$(git status --porcelain)"
+working_tree="$(git status --porcelain)"
+test -z "$working_tree"
 test "$(gh api "repos/$repo/pulls/15" --jq .merged)" = true
 test "$(gh api "repos/$repo/pulls/15" --jq .head.sha)" = "$FILABRIDGE_REVIEWED_HEAD"
 merged_commit="$(gh api "repos/$repo/pulls/15" --jq .merge_commit_sha)"
 test "$(git rev-parse HEAD)" = "$merged_commit"
 test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$merged_commit"
 git merge-base --is-ancestor "$FILABRIDGE_REVIEWED_HEAD" "$merged_commit"
-for commit in $(git rev-list "$base..$FILABRIDGE_REVIEWED_HEAD"); do
+commits="$(git rev-list "$base..$FILABRIDGE_REVIEWED_HEAD")"
+test -n "$commits"
+for commit in $commits; do
   test "$(git show -s --format='%an <%ae>' "$commit")" = 'Marc Went <marc@went.io>'
   git show -s --format=%B "$commit" | grep -Fx 'Signed-off-by: Marc Went <marc@went.io>'
   git verify-commit "$commit"
 done
-test -z "$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}")"
-test "$(gh api --paginate --slurp "repos/$repo/releases?per_page=100" \
-  --jq '[.[][] | select(.tag_name == "v0.3.4")] | length')" = 0
+tag_refs="$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}")"
+test -z "$tag_refs"
+releases="$(gh api --paginate --slurp "repos/$repo/releases?per_page=100")"
+test "$(printf '%s' "$releases" | jq '[.[][] | select(.tag_name == "v0.3.4")] | length')" = 0
 test "$(gh api "repos/$repo" --jq .permissions.push)" = true
 bash scripts/check-release-contract.sh
 bash scripts/verify-golden-fixtures.sh --release
